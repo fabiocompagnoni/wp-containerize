@@ -1,0 +1,20 @@
+# dati privati dell'operatore (clienti, inventari, progetti di lavoro): mai nel repo
+/private/
+
+# segreti: mai nel repo
+.env
+.env.*
+!.env.example
+
+# artefatti locali dei siti (dump, file estratti, report)
+work/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
