@@ -42,7 +42,7 @@ Dettagli completi in `docs/SPEC.md`. Esempio di manifest in `docs/site.example.y
 ## Layout del repo
 ```
 wp_containerize/
-  cli.py  config.py  manifest.py  state.py  secrets.py  log.py
+  cli.py  config.py  manifest.py  state.py  secrets.py  log.py  i18n.py
   docker.py  remote.py
   sources/ftp.py         # mirror FTP/FTPS/SFTP
   wordpress/             # wp-config, checksum, rilevamento
@@ -50,13 +50,19 @@ wp_containerize/
   templates/wordpress/   # Dockerfile, compose, apache, php.ini, my.cnf, wp-config
   templates/static/
   scanners/              # regole YARA, query SQL sospette
+  locale/                # traduzioni gettext (en)
 infra/                   # traefik, egress, restic, daemon.json
-docs/
+docs/                    # italiano; docs/en/ traduzione inglese
 tests/
 ```
 Il progetto di lavoro dell'operatore (`wp-containerize.yml`, `.env`, `sites/`, `work/`)
 vive fuori dal repo o in `private/`, esclusa da git: non leggerne né citarne il contenuto
 in file versionati.
+
+## Lingua
+Italiano come lingua principale (documentazione, messaggi CLI, commenti, commit);
+traduzione inglese in `docs/en/` e nei cataloghi gettext. Identificatori del codice in inglese.
+Ogni modifica a un documento o a un messaggio va riportata anche nella traduzione.
 
 ## Come lavorare
 - Procedi per milestone, ognuna chiusa con una prova end-to-end. Non scrivere tutto insieme.

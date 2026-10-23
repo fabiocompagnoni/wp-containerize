@@ -262,7 +262,14 @@ wp-containerize rebuild --all
 wp-containerize status [--all] | report <sito> | capacity
 ```
 
-## 9. Qualità e sicurezza del codice
+## 9. Lingua
+- **Italiano come lingua principale**: documentazione, messaggi della CLI, commenti, commit.
+- **Traduzione inglese**: documentazione in `docs/en/` (stesso albero), messaggi della CLI
+  tradotti con gettext (lingua scelta da `LANG` o `--lang`).
+- Identificatori del codice (nomi di moduli, funzioni, variabili, chiavi di configurazione)
+  in inglese, come da convenzione.
+
+## 10. Qualità e sicurezza del codice
 - Python 3.12+ con type hints completi; `ruff`, `mypy --strict`, `bandit`, `pip-audit`.
 - `subprocess` sempre con liste di argomenti, mai `shell=True`; timeout espliciti.
 - Validazione di domini, percorsi e nomi di file (niente path traversal dai file estratti).
@@ -270,12 +277,12 @@ wp-containerize status [--all] | report <sito> | capacity
 - Test con `pytest`; FTP contro server di test locale (`pyftpdlib`); integrazione Docker
   marcata e opzionale; mai test contro server reali.
 
-## 10. Flusso git
+## 11. Flusso git
 Branch per tipologia (`feat/`, `fix/`, `docs/`, `chore/`, `test/`, `refactor/`), commit
 atomici con messaggi brevi in stile Conventional Commits, niente trailer di co-autore,
 `main` sempre verde e merge `--no-ff` solo con test passati.
 
-## 11. Da verificare
+## 12. Da verificare
 - Comando `clpctl` per creare un sito Reverse Proxy su CloudPanel.
 - Disponibilità del tag `php:8.5.<patch>-apache` con le ultime patch di sicurezza.
 - Comportamento FTP degli hosting più diffusi (connessioni parallele, FTPS esplicito, `MLSD`).
