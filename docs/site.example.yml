@@ -1,0 +1,79 @@
+# Esempio di manifest per sito — sites/esempio.it.yml
+# "inventory" lo popola `discover`; "target", "security" e "cache" si rivedono a mano.
+# Nessun segreto qui: le credenziali stanno in .env con prefisso <slug>__ (vedi SPEC §2.1).
+
+site: esempio.it
+slug: ESEMPIO_IT              # prefisso delle chiavi in .env, univoco
+aliases: [www.esempio.it]
+client: "Cliente Esempio Srl"
+type: wordpress               # wordpress | static
+
+source:
+  provider: cpanel            # cpanel | cloudpanel | plesk | other (solo informativo)
+  account: hosting-esempio
+  host: ftp.example.net
+  docroot: /public_html
+  # connessione FTP da .env: ESEMPIO_IT__FTP_HOST, __FTP_USER, __FTP_PASSWORD,
+  # __FTP_PROTO (ftp|ftps|sftp), __FTP_PORT
+
+inventory:
+  app_version: "6.2.14"
+  php_version_source: "7.4.33"
+  table_prefix: wp_
+  db_charset: utf8mb4
+  php_extensions: [mysqli, gd, intl, zip, exif]
+  ini_overrides: {upload_max_filesize: 64M, memory_limit: 256M}
+  plugins:
+    - {slug: contact-form-7, version: "5.9.8", source: wordpress.org}
+    - {slug: litespeed-cache, version: "6.5", source: wordpress.org}   # rimosso in upgrade
+    - {slug: divi-builder, version: "4.20.4", source: premium}
+  themes:
+    - {slug: Divi, version: "4.20.4", source: premium}
+  cron:
+    - "*/15 * * * * php wp-cron.php"
+  external_services: [smtp.esempio-provider.it, api.stripe.com]
+  size: {files_mb: 2100, uploads_mb: 1850}
+
+target:
+  php: "8.5"                  # override del default in wp-containerize.yml
+  uid: 20017                  # assegnato da `site add`, univoco
+  legacy_exception: false
+  legacy_reason: null
+
+security:
+  read_only: true
+  writable_paths: []          # oltre a uploads/ e cache/, es. [wp-content/wflogs]
+  egress:
+    allow: [api.stripe.com:443]
+  smtp:                       # unica uscita email, password in ESEMPIO_IT__SMTP_PASSWORD
+    host: smtp.esempio-provider.it
+    port: 587
+    user: noreply@esempio.it
+  premium_update_hosts: [www.elegantthemes.com]   # allowlist per `wp-containerize wp` in locale
+  limits: {cpus: "0.5", memory: 192m, pids: 100}
+
+cache:
+  page: true                  # page cache su file servita senza PHP
+  cdn_max_age: 3600           # Cache-Control per la CDN (secondi)
+  redis_maxmemory: 32mb
+  mariadb_buffer_pool: 64M
+
+verify:
+  urls: [/, /contatti/, /wp-login.php]
+
+cutover:
+  ttl_lowered_at: null
+  rollback_days: 14
+
+status:
+  discover:  {state: done, finished_at: "2026-10-24T10:12:00+02:00", artifacts: {report: "sha256:..."}}
+  extract:   {state: pending}
+  scan:      {state: pending, reviewed_by: null}
+  ai-review: {state: pending}
+  clean:     {state: pending}
+  upgrade:   {state: pending}
+  build:     {state: pending}
+  deploy:    {state: pending}
+  verify:    {state: pending}
+  cutover:   {state: pending}
+  backup:    {state: pending}
