@@ -59,7 +59,7 @@ I template Jinja del tool si sovrascrivono copiandoli in `templates/` del proget
 
 ## 3. Piattaforme e dipendenze
 
-- Linux, macOS, Windows tramite **WSL**. Sull'host servono solo **Python 3.12+, Docker, ssh**.
+- Linux, macOS, Windows tramite **WSL**. Sull'host servono solo **Python 3.12+, Docker, ssh, git**.
 - Installazione: `uv tool install wp-containerize` (o `pipx`). Pacchetto Python
   `wp_containerize`, comando `wp-containerize`.
 - FTP/FTPS in Python (`ftplib` con riuso della sessione TLS sul canale dati, `MLSD`,
@@ -264,8 +264,10 @@ wp-containerize status [--all] | report <sito> | capacity
 
 ## 9. Lingua
 - **Italiano come lingua principale**: documentazione, messaggi della CLI, commenti, commit.
-- **Traduzione inglese**: documentazione in `docs/en/` (stesso albero), messaggi della CLI
-  tradotti con gettext (lingua scelta da `LANG` o `--lang`).
+- **Traduzione inglese**: dopo la prima release stabile, la documentazione ha un albero
+  parallelo completo in `docs/en/`; i messaggi della CLI sono tradotti con gettext (lingua
+  scelta da `LANG` o `--lang`). Fino alla prima release stabile si traduce subito solo il
+  README (`README.en.md`); le stringhe della CLI sono sempre dentro `_()`.
 - Identificatori del codice (nomi di moduli, funzioni, variabili, chiavi di configurazione)
   in inglese, come da convenzione.
 
