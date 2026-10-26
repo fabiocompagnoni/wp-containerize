@@ -85,7 +85,8 @@ nessun web server sull'host.
   fallisce, niente reload.
 - I vhost risolvono l'upstream con il resolver DNS di Docker (`resolver 127.0.0.11`) e un
   upstream in variabile: nginx parte e si ricarica anche se il container `app` di un sito
-  è fermo o la sua rete manca. Quel sito risponde 502, gli altri restano su.
+  è fermo o non è ancora collegato alla sua rete `<sito>_edge` (la rete esiste sempre,
+  §4.2). Quel sito risponde 502, gli altri restano su.
 - `docker compose up -d` su `edge` ricrea il container quando cambiano le sue reti: breve
   interruzione su 80/443 **per tutti i siti**. Succede solo al primo deploy e alla
   rimozione di un sito (§4.2), non ai deploy successivi.
@@ -145,8 +146,10 @@ In entrambi i casi:
     (deploy in corso) o `done`, ricavate dai manifest e dichiarate `external`. Il sito del
     primo deploy è quindi già incluso al passo 6 (§7.10).
   - `deploy`, la rimozione di un sito e `infra up` rigenerano quel compose e applicano
-    `docker compose up -d` su `edge`. Una ricreazione del container `edge` mantiene così
-    tutti i collegamenti.
+    `docker compose up -d` su `edge`. Prima di ogni `up -d` il tool crea, in modo
+    idempotente, ogni rete `<sito>_edge` elencata che non esiste ancora: il compose di
+    `edge` non fallisce mai per una rete mancante. Una ricreazione del container `edge`
+    mantiene così tutti i collegamenti.
   - Rimozione di un sito, in ordine inverso al deploy:
     1. vhost rimosso, poi `nginx -t` e reload;
     2. `compose.yaml` di `edge` rigenerato senza la rete del sito e `docker compose up -d`
