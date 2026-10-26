@@ -2,8 +2,8 @@
 
 Tool CLI open source per migrare siti **WordPress** da hosting condivisi (cPanel,
 CloudPanel, Plesk o qualunque hosting raggiungibile via FTP/SFTP) a stack Docker isolati
-su una VPS, ripulendoli e aggiornandoli lungo la strada. Resta lo strumento di
-manutenzione dei siti migrati: tutto è parametrico e configurabile.
+su una VPS, ripulendoli e aggiornandoli lungo la strada. Dopo il rilascio i siti migrati
+vengono mantenuti aggiornati in automatico (§4.6): tutto è parametrico e configurabile.
 
 Pensato in particolare per i siti **potenzialmente compromessi** (PHP fuori supporto,
 falle sfruttate attivamente): nessun sito arriva in produzione senza essere stato
@@ -12,7 +12,9 @@ analizzato e ripulito.
 ## 0. Ambito
 
 **Dentro**: pipeline automatica per WordPress; hosting di siti statici HTML con un
-template dedicato (estrazione + scansione + build/deploy, niente upgrade).
+template dedicato (estrazione + scansione + build/deploy, niente upgrade); bundle
+portabile per sito, avviabile con `docker compose up` anche senza il tool (§5.1);
+manutenzione automatica dei siti dopo il rilascio (§4.6).
 
 **Fuori**: redirect di dominio, altri CMS, applicazioni PHP custom, posta (il tool non
 tocca mai MX/SPF/DKIM), modifica automatica dei DNS, scelta del provider CDN (il tool
@@ -39,7 +41,7 @@ codice del tool. Tre livelli, nessun valore cablato nel codice:
 
 | File | Contenuto | Da versionare? |
 |---|---|---|
-| `wp-containerize.yml` | registry, VPS, edge (TLS, IP della CDN), backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
+| `wp-containerize.yml` | registry, VPS, edge (TLS, IP della CDN), manutenzione, backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
 | `sites/<dominio>.yml` | manifest del sito: sorgente, inventario, target, sicurezza, stato | sì, privato |
 | `.env` | **tutti** i segreti | **mai** (permessi 600) |
 
@@ -105,13 +107,16 @@ In entrambi i casi:
 /srv/infra/
   edge/                      nginx: compose.yaml, conf.d/ (vhost, read-only), certs/ (0600)
   egress/                    proxy di egress con allowlist
+  maintainer/                manutenzione automatica (§4.6)
   backup/                    runner restic
-/srv/sites/<sito>/           un sito = una cartella (self-contained)
-  compose.yaml
-  .env                       generato, 0600, owner root
+/srv/sites/<sito>/           un sito = una cartella = il bundle di `build` (§5.1)
+  compose.yaml               immagine per digest
+  .env                       generato da .env.example, 0600, owner root
+  README
   data/uploads/              contenuti utente
   cache/                     page cache
-  db/                        dati MariaDB
+  db/dump.sql.gz             importato al primo avvio
+  db/                        dati MariaDB (percorso separato dal dump: [DA DEFINIRE])
 ```
 
 ### 4.2 Stack per sito (stesso template in locale e in produzione)
@@ -146,7 +151,62 @@ Obiettivo: quasi tutte le richieste servite da cache e CDN, container con risors
 restic per sito verso qualunque repository restic (SFTP come Hetzner Storage Box, S3,
 B2, …): dump giornaliero del DB + `data/`, retention configurabile, test di restore periodico.
 
+### 4.6 Manutenzione automatica
+Due momenti distinti: la **preparazione** (pipeline del §7, che porta il sito pulito e
+aggiornato in produzione, §5) e la **manutenzione** dopo il rilascio, descritta qui.
+
+Un container **`maintainer`** in `/srv/infra/maintainer` sulla VPS, con uno scheduler
+interno (es. supercronic, **[DA VERIFICARE]**). A ogni esecuzione, per ogni sito con
+`maintenance.enabled`:
+
+1. Controlla se ci sono: una nuova patch PHP (digest dell'immagine base cambiato), una
+   nuova versione del core WordPress, nuove versioni di plugin e temi **del repository
+   ufficiale**. Se non c'è nessun aggiornamento, si ferma qui.
+2. Backup del DB (restic) prima di qualunque modifica.
+3. Aggiornamenti applicati in un container `dev` effimero sul codice del sito; unica
+   uscita il proxy di egress con allowlist (`*.wordpress.org`).
+4. Scan dei file cambiati (checksum ufficiali + euristiche del §7.4): con finding `high`
+   si ferma e notifica.
+5. Build in un builder isolato (BuildKit in container, rootless **[DA VERIFICARE]**).
+6. trivy, SBOM e firma (§5).
+7. Push sul registry.
+8. Deploy per digest, poi `wp core update-db`, poi `verify` (§7.11).
+9. Se `verify` fallisce: **rollback automatico** al digest precedente e restore del DB
+   dal backup del punto 2.
+10. Notifica all'operatore con l'esito (email via SMTP configurato e/o webhook).
+
+Regole:
+- Plugin e temi premium o custom **non** si aggiornano da soli: vengono segnalati nel
+  report per un `upgrade` manuale.
+- `maintainer` comanda Docker senza il socket grezzo: passa da un proxy dell'API Docker
+  ristretto alle chiamate necessarie (es. `docker-socket-proxy`, **[DA VERIFICARE]**).
+- Il codice dei siti non gira mai nel container `maintainer`: solo nei container `dev`
+  effimeri e nel builder.
+- Il codice aggiornato viene registrato nel repo git del sito (commit automatico con
+  l'elenco degli aggiornamenti), così la build resta riproducibile.
+  **[DA DEFINIRE nel piano della milestone]**: dove vive il repo del sito sulla VPS e come
+  si sincronizza con la macchina dell'operatore.
+- Credenziali di push sul registry e chiave cosign per i punti 6–7 sulla VPS: come
+  arrivano al `maintainer` **[DA DEFINIRE]**.
+- `wp-containerize maintain <sito>|--all [--dry-run]` esegue lo stesso ciclo a mano dalla
+  macchina dell'operatore. La sola ricostruzione per una patch PHP è un caso particolare
+  di `maintain --all`.
+
+Configurazione:
+- `wp-containerize.yml`: `maintenance.enabled` (default `true`), `maintenance.schedule` in
+  sintassi cron (default `"0 4 * * *"`), `maintenance.notify` con `email` e/o `webhook`.
+- L'URL del webhook è un segreto: sta in `.env` (nome della chiave **[DA DEFINIRE]**).
+- SMTP usato per le notifiche (host, utente, password in `.env`): **[DA DEFINIRE]**.
+- Manifest del sito: `maintenance.enabled` (default `true`), `maintenance.auto_plugins`
+  (default `true`: aggiorna in automatico plugin e temi del repository ufficiale).
+
 ## 5. Immagini Docker
+
+**Preparazione prima del push.** Un'immagine arriva sul registry solo dopo la pipeline
+completa: analisi dei file attuali della sorgente per compromissioni e codice malevolo
+(`scan`), pulizia (`clean`), aggiornamento di core, plugin e temi **all'ultima versione**
+e di PHP all'ultima patch (`upgrade`). Solo con `scan` e trivy puliti l'immagine viene
+pubblicata. Dopo il rilascio subentra la manutenzione automatica (§4.6).
 
 - Immagine propria, **non** `wordpress` ufficiale (il suo `VOLUME /var/www/html` rende
   il codice scrivibile e persistente tra gli aggiornamenti).
@@ -162,13 +222,33 @@ B2, …): dump giornaliero del DB + `data/`, retention configurabile, test di re
 - `build` esegue **trivy** (blocca su CRITICAL/HIGH con fix disponibile), genera la SBOM
   (syft) e **firma** l'immagine con cosign; push su un **registry OCI privato**
   (es. GHCR). La VPS fa solo pull, **per digest**.
-- Retention delle immagini configurabile. `wp-containerize rebuild --all` ricostruisce
-  tutto quando esce una patch PHP.
+- Retention delle immagini configurabile. Quando esce una patch PHP le immagini si
+  ricostruiscono con `maintain` (§4.6).
 - Template `static`: `httpd:alpine` con i file del sito, read-only.
+
+### 5.1 Bundle portabile
+Oltre all'immagine sul registry, `build` produce `work/<sito>/bundle/`:
+
+```
+compose.yaml                 immagine referenziata per digest
+.env.example                 solo i nomi delle variabili, senza valori
+data/uploads/                ripulito, senza file PHP
+db/dump.sql.gz               dump ripulito
+README                       istruzioni
+```
+
+- `docker compose up` avvia il bundle su qualunque host Docker, in locale o su una VPS,
+  **anche senza il tool**: al primo avvio il DB importa il dump. Serve l'accesso in pull
+  al registry.
+- `deploy` copia il bundle via ssh e lo avvia; `local up` usa lo stesso bundle.
+- Non è una fase: il bundle è un artefatto di `build`.
+- Un solo bundle per locale e produzione: dove e per quale URL si esegue
+  `wp search-replace` sul dump **[DA DEFINIRE]**.
 
 ## 6. Manifest per sito
 `sites/<dominio>.yml`: identità (`site`, `slug`, `aliases`, `client`), sorgente,
-inventario (popolato da `discover`), target, sicurezza, cache, verifica, cutover, stato.
+inventario (popolato da `discover`), target, sicurezza, cache, verifica, cutover,
+manutenzione (§4.6), stato.
 Ogni fase scrive gli artefatti in `work/<sito>/<fase>/` e aggiorna `status.<fase>`
 con `state`, `started_at`, `finished_at`, `artifacts` (SHA-256), `notes`.
 Esempio in `docs/site.example.yml`.
@@ -225,7 +305,9 @@ Disattivata di default (`ai_review.enabled`), perché invia codice dei siti all'
 Anthropic: l'operatore la attiva consapevolmente.
 
 ### 7.6 `local up` / `wp`
-Stack del sito in locale su `http://<sito>.localhost`, dati estratti.
+Stack del sito in locale su `http://<sito>.localhost`, dati estratti. Dopo `build`,
+`local up` avvia lo stesso bundle della produzione (§5.1); cosa avvia prima che esista
+un bundle **[DA DEFINIRE]**.
 `wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è un
 proxy per sito con allowlist (`*.wordpress.org` + host dei plugin premium dichiarati),
 configurato sia con `WP_PROXY_*` sia con `HTTP(S)_PROXY`. wp-cli non gira mai su codice
@@ -244,12 +326,13 @@ temi/plugin custom). Siti non portabili in tempi ragionevoli:
 `target.legacy_exception: true` con motivazione.
 
 ### 7.9 `build`
-Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5).
+Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5); produce il
+bundle portabile `work/<sito>/bundle/` (§5.1).
 
 ### 7.10 `deploy`
-Via ssh, idempotente: UID/GID, `/srv/sites/<sito>` (0750), `.env` 0600, rsync di `data/`,
-creazione DB, import del dump pulito con `wp search-replace`, pull per digest, avvio, vhost
-nginx su `edge` (§4.1) con `nginx -t` e reload. Nessun DNS toccato.
+Via ssh, idempotente: UID/GID, copia del bundle (§5.1) in `/srv/sites/<sito>` (0750),
+`.env` 0600 generato da `.env.example`, pull per digest, avvio (al primo avvio il DB importa
+il dump), vhost nginx su `edge` (§4.1) con `nginx -t` e reload. Nessun DNS toccato.
 
 ### 7.11 `verify`
 Via tunnel ssh con header `Host` (niente sottodomini pubblici di staging): status code
@@ -278,7 +361,8 @@ wp-containerize run <sito>|--all --until <fase>   # batch, si ferma ai punti di 
 wp-containerize local up|down <sito>
 wp-containerize wp <sito> -- <argomenti wp-cli>
 wp-containerize db <sito>
-wp-containerize rebuild --all
+wp-containerize maintain <sito>|--all [--dry-run]   # manutenzione (§4.6), anche a mano
+wp-containerize infra up|status                    # edge, egress, maintainer sulla VPS
 wp-containerize status [--all] | report <sito> | capacity
 ```
 
@@ -306,5 +390,9 @@ atomici con messaggi brevi in stile Conventional Commits, niente trailer di co-a
 
 ## 12. Da verificare
 - Come ottenere e aggiornare le liste di IP dei principali CDN (`edge.trusted_proxies`).
+- Scheduler interno del `maintainer` (es. supercronic).
+- BuildKit in container in modalità rootless per il builder isolato della manutenzione.
+- Proxy dell'API Docker per il `maintainer` (es. `docker-socket-proxy`) e insieme minimo
+  di chiamate da consentire.
 - Disponibilità del tag `php:8.5.<patch>-apache` con le ultime patch di sicurezza.
 - Comportamento FTP degli hosting più diffusi (connessioni parallele, FTPS esplicito, `MLSD`).
