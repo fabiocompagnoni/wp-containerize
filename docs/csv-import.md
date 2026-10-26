@@ -27,7 +27,7 @@ Le colonne non elencate vengono ignorate.
 ## Tipo della riga
 Il tipo di ogni riga si risolve così:
 1. Se `tipo` ha un valore, prevale su `categoria`. Valori ammessi: `wordpress`, `static`.
-   Un valore non ammesso è un errore: la riga viene saltata e segnalata con il suo numero.
+   Un valore non ammesso è un errore di riga (vedi sotto).
 2. Se `tipo` è vuoto o assente, si guarda `categoria`. Valori riconosciuti: `wordpress`,
    `statico` (che dà il tipo `static`). Con un'altra categoria la riga viene saltata e
    segnalata come "categoria non gestita"; non è un errore.
@@ -37,11 +37,16 @@ Il tipo di ogni riga si risolve così:
 Il confronto dei valori non distingue maiuscole e minuscole e ignora gli spazi
 (` WordPress ` equivale a `wordpress`).
 
+## Errori di riga e codice di uscita
+Qualunque errore di riga (dominio vuoto o non valido, `tipo` non ammesso) salta la riga, la
+segnala con il suo numero e fa uscire il comando con codice 1; le righe valide vengono
+comunque importate. Le righe saltate senza errore (categoria non gestita, dominio duplicato,
+manifest già esistente) vengono segnalate ma non cambiano il codice di uscita.
+
 ## Dominio
 - Prima della validazione il dominio viene normalizzato: spazi rimossi, minuscolo, punto
   finale tolto, IDN convertito.
-- Un dominio vuoto o non valido è un errore: la riga viene saltata e segnalata con il suo
-  numero, le righe valide vengono comunque importate e il comando esce con codice 1.
+- Un dominio vuoto o non valido è un errore di riga (vedi sopra).
 - Se un dominio compare più volte nel file vale la prima occorrenza; le successive vengono
   segnalate e saltate.
 - Un dominio che ha già un manifest viene saltato e segnalato; non è un errore.
