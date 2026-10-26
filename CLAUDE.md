@@ -34,14 +34,14 @@ Dettagli completi in `docs/SPEC.md`. Esempio di manifest in `docs/site.example.y
 ## Stack del tool
 - Python 3.12+, `typer`, `pydantic` + `pydantic-settings`, `ruamel.yaml` (commenti
   preservati), `jinja2`, `httpx`, `paramiko`, `rich`.
-- Sull'host solo Python, Docker, ssh. Tutto il resto in container: MariaDB, wp-cli,
+- Sull'host solo Python, Docker, ssh, git. Tutto il resto in container: MariaDB, wp-cli,
   ClamAV, YARA, trivy, syft, cosign, restic. Claude Code CLI opzionale.
 - Qualità: `ruff`, `mypy --strict`, `bandit`, `pip-audit`, `pytest`.
   Mai test contro server reali: FTP con `pyftpdlib`, HTTP con risposte registrate.
 
 ## Layout del repo
 ```
-wp_containerize/
+src/wp_containerize/
   cli.py  config.py  manifest.py  state.py  secrets.py  log.py  i18n.py
   docker.py  remote.py
   sources/ftp.py         # mirror FTP/FTPS/SFTP
@@ -52,7 +52,7 @@ wp_containerize/
   scanners/              # regole YARA, query SQL sospette
   locale/                # traduzioni gettext (en)
 infra/                   # traefik, egress, restic, daemon.json
-docs/                    # italiano; docs/en/ traduzione inglese
+docs/                    # italiano; docs/en/ traduzione inglese (dopo la prima release stabile)
 tests/
 ```
 Il progetto di lavoro dell'operatore (`wp-containerize.yml`, `.env`, `sites/`, `work/`)
@@ -61,8 +61,10 @@ in file versionati.
 
 ## Lingua
 Italiano come lingua principale (documentazione, messaggi CLI, commenti, commit);
-traduzione inglese in `docs/en/` e nei cataloghi gettext. Identificatori del codice in inglese.
-Ogni modifica a un documento o a un messaggio va riportata anche nella traduzione.
+traduzione inglese nei cataloghi gettext e, dopo la prima release stabile, in `docs/en/`
+(albero parallelo completo). Identificatori del codice in inglese.
+Fino alla prima release stabile si traduce subito solo il README (`README.en.md`); le
+stringhe della CLI sono sempre dentro `_()`.
 
 ## Come lavorare
 - Procedi per milestone, ognuna chiusa con una prova end-to-end. Non scrivere tutto insieme.
