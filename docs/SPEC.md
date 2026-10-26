@@ -39,7 +39,7 @@ codice del tool. Tre livelli, nessun valore cablato nel codice:
 
 | File | Contenuto | Da versionare? |
 |---|---|---|
-| `wp-containerize.yml` | registry, VPS, modalità proxy, backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
+| `wp-containerize.yml` | registry, VPS, edge (TLS, IP della CDN), backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
 | `sites/<dominio>.yml` | manifest del sito: sorgente, inventario, target, sicurezza, stato | sì, privato |
 | `.env` | **tutti** i segreti | **mai** (permessi 600) |
 
@@ -70,24 +70,42 @@ I template Jinja del tool si sovrascrivono copiandoli in `templates/` del proget
 
 ## 4. Architettura di destinazione
 
-### 4.1 VPS e reverse proxy
-Un IP per tutti i siti; **Traefik** smista per host ai container. Due modalità
-(`proxy.mode` in `wp-containerize.yml`):
+### 4.1 VPS e reverse proxy nginx
+Un IP per tutti i siti. **Tutto lo stack della VPS è in container**: nessun pannello e
+nessun web server sull'host.
 
-- `standalone`: Traefik su 80/443, certificati Let's Encrypt gestiti da Traefik.
-- `behind-proxy`: la VPS ha già un web server su 80/443 (es. CloudPanel, nginx, Caddy)
-  che gestisce TLS. Traefik ascolta **solo su 127.0.0.1** in HTTP e il proxy esistente
-  inoltra a Traefik i domini migrati. Il tool genera la configurazione o la checklist per
-  il proxy esistente (CloudPanel: sito di tipo Reverse Proxy, **[DA VERIFICARE]** via
-  `clpctl`).
-
-In entrambi i casi:
+- Un unico container **`edge`** (nginx) ascolta su 80/443 e smista per `Host` ai
+  container `app` dei siti.
+- Un file di vhost per sito, generato dal tool da un template Jinja in
+  `/srv/infra/edge/conf.d/`, montato **read-only** nel container.
+- Reload: `nginx -t` e poi `nginx -s reload` dentro il container. Se `nginx -t`
+  fallisce, niente reload.
+- `edge` **non** ha accesso al socket Docker.
 - `daemon.json` con `default-address-pools` (es. `10.200.0.0/16` in /24), perché ogni
   sito usa due reti.
-- `wp-config.php` fida di `X-Forwarded-Proto`/`X-Forwarded-For` solo dal proxy.
+
+**TLS gestito dalla CDN**: niente certificati automatici sulla VPS (né Let's Encrypt né
+certbot). Due modalità (`edge.tls` in `wp-containerize.yml`):
+
+- `origin-cert` (default): nginx termina TLS con il **certificato origin** rilasciato
+  dalla CDN, fornito dall'operatore per dominio. Sta in `/srv/infra/edge/certs/`, permessi
+  `0600`, mai nei log. Nomi dei file per dominio **[DA DEFINIRE]**.
+- `http`: nginx serve solo la porta 80 dietro la CDN. **Sconsigliato**: il tool lo
+  segnala come tale.
+
+In entrambi i casi:
+- Accesso all'origine consentito **solo dagli IP della CDN** (`edge.trusted_proxies`,
+  lista CIDR configurabile). Comportamento con lista vuota **[DA DEFINIRE]**.
+- IP reale del client preso dall'header della CDN (`edge.real_ip_header`, es.
+  `CF-Connecting-IP`) solo per richieste da quegli IP.
+- `wp-config.php` fida di `X-Forwarded-Proto`/`X-Forwarded-For` solo da `edge`.
+- Come si ottengono e si aggiornano le liste di IP dei principali CDN: **[DA VERIFICARE]**.
 
 ```
-/srv/infra/                  traefik, egress, backup runner
+/srv/infra/
+  edge/                      nginx: compose.yaml, conf.d/ (vhost, read-only), certs/ (0600)
+  egress/                    proxy di egress con allowlist
+  backup/                    runner restic
 /srv/sites/<sito>/           un sito = una cartella (self-contained)
   compose.yaml
   .env                       generato, 0600, owner root
@@ -104,7 +122,8 @@ In entrambi i casi:
   PHP disabilitato in `uploads/` e `cache/`.
 - `db`: **MariaDB dedicato**, volume `db/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
 - `redis`: **dedicato**, senza persistenza, `maxmemory` configurabile.
-- Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔traefik).
+- Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔edge).
+  `edge` è collegato alle reti `<sito>_edge` di tutti i siti; i siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
   (`security.egress.allow`); l'email passa da `msmtp` nell'immagine verso l'SMTP
   configurato, unico host:porta consentito.
@@ -229,8 +248,8 @@ Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5).
 
 ### 7.10 `deploy`
 Via ssh, idempotente: UID/GID, `/srv/sites/<sito>` (0750), `.env` 0600, rsync di `data/`,
-creazione DB, import del dump pulito con `wp search-replace`, pull per digest, avvio, route
-Traefik. Nessun DNS toccato.
+creazione DB, import del dump pulito con `wp search-replace`, pull per digest, avvio, vhost
+nginx su `edge` (§4.1) con `nginx -t` e reload. Nessun DNS toccato.
 
 ### 7.11 `verify`
 Via tunnel ssh con header `Host` (niente sottodomini pubblici di staging): status code
@@ -240,7 +259,8 @@ in uploads, nessun egress dal container, utente non root, page cache servita sen
 ### 7.12 `cutover`
 1. TTL dei record web abbassato da almeno 24–48 h (il tool lo verifica).
 2. Sync finale: delta FTP + nuovo dump → scan veloce dei delta.
-3. In modalità `behind-proxy`: configurazione del proxy esistente per il dominio.
+3. Vhost nginx del dominio attivo su `edge`: certificato origin presente (modalità
+   `origin-cert`), accesso limitato agli IP della CDN.
 4. **Checklist DNS solo dei record web, mai MX/SPF/DKIM**: il cambio lo fa l'operatore.
 5. Verifica post-switch e certificato.
 6. Sorgente intatta per `cutover.rollback_days`.
@@ -285,6 +305,6 @@ atomici con messaggi brevi in stile Conventional Commits, niente trailer di co-a
 `main` sempre verde e merge `--no-ff` solo con test passati.
 
 ## 12. Da verificare
-- Comando `clpctl` per creare un sito Reverse Proxy su CloudPanel.
+- Come ottenere e aggiornare le liste di IP dei principali CDN (`edge.trusted_proxies`).
 - Disponibilità del tag `php:8.5.<patch>-apache` con le ultime patch di sicurezza.
 - Comportamento FTP degli hosting più diffusi (connessioni parallele, FTPS esplicito, `MLSD`).
