@@ -77,7 +77,7 @@ Un IP per tutti i siti. **Tutto lo stack della VPS è in container**: nessun pan
 nessun web server sull'host.
 
 - Un unico container **`edge`** (nginx) ascolta su 80/443 e smista per `Host` ai
-  container `app` dei siti.
+  container `app` dei siti, raggiunti tramite le reti per sito `<sito>_edge` (§4.2).
 - Un file di vhost per sito, generato dal tool da un template Jinja in
   `/srv/infra/edge/conf.d/`, montato **read-only** nel container.
 - Reload: `nginx -t` e poi `nginx -s reload` dentro il container. Se `nginx -t`
@@ -112,7 +112,7 @@ In entrambi i casi:
   maintainer/                manutenzione automatica (§4.6)
   backup/                    runner restic
 /srv/sites/<sito>/           un sito = una cartella = il bundle di `build` (§5.1)
-  compose.yaml               immagine per digest, rete edge external
+  compose.yaml               immagine per digest, rete <sito>_edge external
   compose.local.yaml         override per l'uso fuori dalla VPS (§5.1)
   .env                       generato da .env.example, 0600, owner root
   README
@@ -131,7 +131,10 @@ In entrambi i casi:
 - `db`: **MariaDB dedicato**, volume `db/data/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
 - `redis`: **dedicato**, senza persistenza, `maxmemory` configurabile.
 - Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔edge).
-  `edge` è collegato alle reti `<sito>_edge` di tutti i siti; i siti non si vedono tra loro.
+  - `<sito>_edge` è **per sito**: la crea il tool (`deploy`/`infra`), che vi collega il
+    container `edge`. Il bundle la dichiara `external` con quel nome.
+  - Non esiste una rete `edge` condivisa: `edge` è collegato a ogni `<sito>_edge` e le
+    app dei siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
   (`security.egress.allow`), applicata da un unico container `egress` condiviso
   (`/srv/infra/egress/`) con ACL per rete di origine; l'email passa da `msmtp` nell'immagine verso l'SMTP
@@ -257,7 +260,7 @@ pubblicata. Dopo il rilascio subentra la manutenzione automatica (§4.6).
 Oltre all'immagine sul registry, `build` produce `work/<sito>/bundle/`:
 
 ```
-compose.yaml                 immagine referenziata per digest, rete edge `external`
+compose.yaml                 immagine referenziata per digest, rete `<sito>_edge` external
 compose.local.yaml           override per l'uso fuori dalla VPS
 .env.example                 solo i nomi delle variabili, senza valori
 data/uploads/                ripulito, senza file PHP
@@ -268,8 +271,8 @@ README                       istruzioni
 - Il bundle si avvia su qualunque host Docker, in locale o su una VPS, **anche senza il
   tool**. Serve l'accesso in pull al registry.
 - Il dump si importa automaticamente **solo al primo avvio**, quando `db/data/` è vuota.
-- Sulla VPS: `docker compose up`, con `compose.yaml` collegato alla rete di `edge` come
-  `external`.
+- Sulla VPS: `docker compose up`. `compose.yaml` dichiara la rete `<sito>_edge` come
+  `external`, con quel nome; la rete esiste già (§4.2).
 - Fuori dalla VPS: `docker compose -f compose.yaml -f compose.local.yaml up`.
   L'override:
   - pubblica `app` su `127.0.0.1:<porta>`;
@@ -371,12 +374,14 @@ Via ssh, idempotente. Nessun DNS toccato.
 
 - **Primo deploy**: UID/GID, copia del bundle (§5.1) in `/srv/sites/<sito>` (0750), `.env`
   0600 generato da `.env.example`, pull per digest, avvio (con `db/data/` vuota il DB
-  importa il dump), vhost nginx su `edge` (§4.1) con `nginx -t` e reload.
+  importa il dump), rete `<sito>_edge` creata e collegata a `edge` (§4.2), vhost nginx su
+  `edge` (§4.1) con `nginx -t` e reload.
 - **Deploy successivi**: aggiornano solo `compose.yaml`, README e `.env.example`, poi pull
   per digest e riavvio.
 - I deploy successivi **non** toccano mai `data/` né il DB: nemmeno con `--force`, nemmeno
-  al passo 8 della manutenzione (§4.6). Il DB di produzione si sostituisce solo al
-  cutover (§7.12).
+  al passo 8 della manutenzione (§4.6). Il deploy non sostituisce mai il DB: lo fanno solo
+  l'import esplicito al cutover (§7.12, punto 3) e il restore automatico del passo 9 della
+  manutenzione (§4.6).
 
 ### 7.11 `verify`
 Via tunnel ssh con header `Host` (niente sottodomini pubblici di staging): status code
