@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wp-containerize"
+version = "0.1.0.dev0"
+description = "Migrazione di siti WordPress da hosting FTP a stack Docker isolati"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "typer",
+    "pydantic>=2",
+    "ruamel.yaml",
+    "python-dotenv",
+    "rich",
+]
+
+[project.scripts]
+wp-containerize = "wp_containerize.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "bandit",
+    "pip-audit",
+    "pre-commit",
+    "babel",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wp_containerize"]
+
+[tool.ruff]
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["docker: test che richiedono un demone Docker"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
