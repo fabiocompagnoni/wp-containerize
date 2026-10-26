@@ -77,7 +77,8 @@ Un IP per tutti i siti. **Tutto lo stack della VPS è in container**: nessun pan
 nessun web server sull'host.
 
 - Un unico container **`edge`** (nginx) ascolta su 80/443 e smista per `Host` ai
-  container `app` dei siti, raggiunti tramite le reti per sito `<sito>_edge` (§4.2).
+  container `app` dei siti, raggiunti tramite le reti per sito `<sito>_edge`, elencate nel
+  suo `compose.yaml` generato dal tool (§4.2).
 - Un file di vhost per sito, generato dal tool da un template Jinja in
   `/srv/infra/edge/conf.d/`, montato **read-only** nel container.
 - Reload: `nginx -t` e poi `nginx -s reload` dentro il container. Se `nginx -t`
@@ -131,10 +132,15 @@ In entrambi i casi:
 - `db`: **MariaDB dedicato**, volume `db/data/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
 - `redis`: **dedicato**, senza persistenza, `maxmemory` configurabile.
 - Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔edge).
-  - `<sito>_edge` è **per sito**: la crea il tool (`deploy`/`infra`), che vi collega il
-    container `edge`. Il bundle la dichiara `external` con quel nome.
-  - Non esiste una rete `edge` condivisa: `edge` è collegato a ogni `<sito>_edge` e le
-    app dei siti non si vedono tra loro.
+  - `<sito>_edge` è **per sito**: la crea il tool (`deploy`/`infra`) se manca. Il bundle
+    la dichiara `external` con quel nome.
+  - Collegamenti di `edge` persistenti, mai a runtime: il tool genera il `compose.yaml` di
+    `edge` con tutte le reti `<sito>_edge` dei siti deployati, ricavate dai manifest e
+    dichiarate `external`.
+  - `deploy`, la rimozione di un sito e `infra up` rigenerano quel compose e applicano
+    `docker compose up -d` su `edge`. Una ricreazione del container `edge` mantiene così
+    tutti i collegamenti.
+  - Non esiste una rete `edge` condivisa: le app dei siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
   (`security.egress.allow`), applicata da un unico container `egress` condiviso
   (`/srv/infra/egress/`) con ACL per rete di origine; l'email passa da `msmtp` nell'immagine verso l'SMTP
@@ -372,10 +378,14 @@ bundle portabile `work/<sito>/bundle/` (§5.1).
 ### 7.10 `deploy`
 Via ssh, idempotente. Nessun DNS toccato.
 
-- **Primo deploy**: UID/GID, copia del bundle (§5.1) in `/srv/sites/<sito>` (0750), `.env`
-  0600 generato da `.env.example`, pull per digest, avvio (con `db/data/` vuota il DB
-  importa il dump), rete `<sito>_edge` creata e collegata a `edge` (§4.2), vhost nginx su
-  `edge` (§4.1) con `nginx -t` e reload.
+- **Primo deploy**, in quest'ordine:
+  1. UID/GID;
+  2. copia del bundle (§5.1) in `/srv/sites/<sito>` (0750);
+  3. rete `<sito>_edge` creata, se manca, prima di `docker compose up`;
+  4. `.env` 0600 generato da `.env.example`;
+  5. pull per digest e avvio (con `db/data/` vuota il DB importa il dump);
+  6. `compose.yaml` di `edge` rigenerato e `docker compose up -d` su `edge` (§4.2);
+  7. vhost nginx su `edge` (§4.1) con `nginx -t` e reload.
 - **Deploy successivi**: aggiornano solo `compose.yaml`, README e `.env.example`, poi pull
   per digest e riavvio.
 - I deploy successivi **non** toccano mai `data/` né il DB: nemmeno con `--force`, nemmeno
