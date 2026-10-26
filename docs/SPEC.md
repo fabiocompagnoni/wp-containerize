@@ -49,7 +49,7 @@ I template Jinja del tool si sovrascrivono copiandoli in `templates/` del proget
 
 ### 2.1 `.env`
 - Chiavi globali: `REGISTRY_USER`, `REGISTRY_TOKEN`, `VPS_SSH_HOST`, `RESTIC_REPOSITORY`,
-  `RESTIC_PASSWORD`, `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, …
+  `RESTIC_PASSWORD`, `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, `MAINTENANCE_WEBHOOK_URL`, …
 - Chiavi per sito: `<SLUG>__<NOME>`. Lo `slug` è **scritto nel manifest** (non ricavato
   dal dominio), così `a-b.com` e `a.b.com` non collidono. Esempi:
   `ESEMPIO_IT__FTP_HOST`, `…__FTP_USER`, `…__FTP_PASSWORD`, `…__FTP_PROTO`
@@ -85,13 +85,15 @@ nessun web server sull'host.
 - `edge` **non** ha accesso al socket Docker.
 - `daemon.json` con `default-address-pools` (es. `10.200.0.0/16` in /24), perché ogni
   sito usa due reti.
+- `wp-containerize infra up` genera `/srv/infra/*` dai template e avvia `edge`, `egress`
+  e `maintainer` via ssh; `infra status` ne mostra lo stato.
 
 **TLS gestito dalla CDN**: niente certificati automatici sulla VPS (né Let's Encrypt né
 certbot). Due modalità (`edge.tls` in `wp-containerize.yml`):
 
 - `origin-cert` (default): nginx termina TLS con il **certificato origin** rilasciato
-  dalla CDN, fornito dall'operatore per dominio. Sta in `/srv/infra/edge/certs/`, permessi
-  `0600`, mai nei log. Nomi dei file per dominio **[DA DEFINIRE]**.
+  dalla CDN, fornito dall'operatore per dominio:
+  `/srv/infra/edge/certs/<dominio>.crt` e `<dominio>.key`, permessi `0600`, mai nei log.
 - `http`: nginx serve solo la porta 80 dietro la CDN. **Sconsigliato**: il tool lo
   segnala come tale.
 
@@ -106,17 +108,18 @@ In entrambi i casi:
 ```
 /srv/infra/
   edge/                      nginx: compose.yaml, conf.d/ (vhost, read-only), certs/ (0600)
-  egress/                    proxy di egress con allowlist
+  egress/                    proxy di egress condiviso, allowlist per sito (§4.2)
   maintainer/                manutenzione automatica (§4.6)
   backup/                    runner restic
 /srv/sites/<sito>/           un sito = una cartella = il bundle di `build` (§5.1)
-  compose.yaml               immagine per digest
+  compose.yaml               immagine per digest, rete edge external
+  compose.local.yaml         override per l'uso fuori dalla VPS (§5.1)
   .env                       generato da .env.example, 0600, owner root
   README
   data/uploads/              contenuti utente
   cache/                     page cache
-  db/dump.sql.gz             importato al primo avvio
-  db/                        dati MariaDB (percorso separato dal dump: [DA DEFINIRE])
+  db/dump.sql.gz             importato solo al primo avvio, con db/data/ vuota
+  db/data/                   dati MariaDB
 ```
 
 ### 4.2 Stack per sito (stesso template in locale e in produzione)
@@ -125,12 +128,13 @@ In entrambi i casi:
   `cap_drop: [ALL]`, `no-new-privileges`, limiti `cpus`/`mem_limit`/`pids_limit`.
   Scrivibili solo `uploads/`, `cache/` e i percorsi in `security.writable_paths`.
   PHP disabilitato in `uploads/` e `cache/`.
-- `db`: **MariaDB dedicato**, volume `db/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
+- `db`: **MariaDB dedicato**, volume `db/data/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
 - `redis`: **dedicato**, senza persistenza, `maxmemory` configurabile.
 - Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔edge).
   `edge` è collegato alle reti `<sito>_edge` di tutti i siti; i siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
-  (`security.egress.allow`); l'email passa da `msmtp` nell'immagine verso l'SMTP
+  (`security.egress.allow`), applicata da un unico container `egress` condiviso
+  (`/srv/infra/egress/`) con ACL per rete di origine; l'email passa da `msmtp` nell'immagine verso l'SMTP
   configurato, unico host:porta consentito.
 
 ### 4.3 Accesso al DB
@@ -194,11 +198,16 @@ Regole:
 
 Configurazione:
 - `wp-containerize.yml`: `maintenance.enabled` (default `true`), `maintenance.schedule` in
-  sintassi cron (default `"0 4 * * *"`), `maintenance.notify` con `email` e/o `webhook`.
-- L'URL del webhook è un segreto: sta in `.env` (nome della chiave **[DA DEFINIRE]**).
+  sintassi cron (default `"0 4 * * *"`), `maintenance.notify` con `email` (indirizzo,
+  default nessuno) e `webhook` (`true`/`false`, default `false`).
+- L'URL del webhook è un segreto: sta in `.env`, chiave globale `MAINTENANCE_WEBHOOK_URL`.
 - SMTP usato per le notifiche (host, utente, password in `.env`): **[DA DEFINIRE]**.
 - Manifest del sito: `maintenance.enabled` (default `true`), `maintenance.auto_plugins`
-  (default `true`: aggiorna in automatico plugin e temi del repository ufficiale).
+  (default `true`).
+- Manutenzione attiva per un sito solo se `maintenance.enabled` è vero **sia** nel
+  progetto **sia** nel manifest.
+- `auto_plugins: false`: si aggiornano solo PHP/immagine base e core; plugin e temi
+  vengono solo segnalati nel report.
 
 ## 5. Immagini Docker
 
@@ -230,20 +239,28 @@ pubblicata. Dopo il rilascio subentra la manutenzione automatica (§4.6).
 Oltre all'immagine sul registry, `build` produce `work/<sito>/bundle/`:
 
 ```
-compose.yaml                 immagine referenziata per digest
+compose.yaml                 immagine referenziata per digest, rete edge `external`
+compose.local.yaml           override per l'uso fuori dalla VPS
 .env.example                 solo i nomi delle variabili, senza valori
 data/uploads/                ripulito, senza file PHP
 db/dump.sql.gz               dump ripulito
 README                       istruzioni
 ```
 
-- `docker compose up` avvia il bundle su qualunque host Docker, in locale o su una VPS,
-  **anche senza il tool**: al primo avvio il DB importa il dump. Serve l'accesso in pull
-  al registry.
+- Il bundle si avvia su qualunque host Docker, in locale o su una VPS, **anche senza il
+  tool**. Serve l'accesso in pull al registry.
+- Il dump si importa automaticamente **solo al primo avvio**, quando `db/data/` è vuota.
+- Sulla VPS: `docker compose up`, con `compose.yaml` collegato alla rete di `edge` come
+  `external`.
+- Fuori dalla VPS: `docker compose -f compose.yaml -f compose.local.yaml up`.
+  L'override:
+  - pubblica `app` su `127.0.0.1:<porta>`;
+  - non usa la rete external;
+  - imposta `WP_HOME`/`WP_SITEURL` da env (`wp-config.php` è generato da env).
 - `deploy` copia il bundle via ssh e lo avvia; `local up` usa lo stesso bundle.
 - Non è una fase: il bundle è un artefatto di `build`.
-- Un solo bundle per locale e produzione: dove e per quale URL si esegue
-  `wp search-replace` sul dump **[DA DEFINIRE]**.
+- In locale gli URL assoluti nei contenuti restano quelli di produzione: se e come
+  eseguire `wp search-replace` **[DA DEFINIRE]**.
 
 ## 6. Manifest per sito
 `sites/<dominio>.yml`: identità (`site`, `slug`, `aliases`, `client`), sorgente,
@@ -308,8 +325,8 @@ Anthropic: l'operatore la attiva consapevolmente.
 Stack del sito in locale su `http://<sito>.localhost`, dati estratti. Dopo `build`,
 `local up` avvia lo stesso bundle della produzione (§5.1); cosa avvia prima che esista
 un bundle **[DA DEFINIRE]**.
-`wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è un
-proxy per sito con allowlist (`*.wordpress.org` + host dei plugin premium dichiarati),
+`wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è il
+proxy `egress`, con l'allowlist del sito (`*.wordpress.org` + host dei plugin premium dichiarati),
 configurato sia con `WP_PROXY_*` sia con `HTTP(S)_PROXY`. wp-cli non gira mai su codice
 non ancora scansionato.
 
@@ -330,9 +347,16 @@ Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5); pr
 bundle portabile `work/<sito>/bundle/` (§5.1).
 
 ### 7.10 `deploy`
-Via ssh, idempotente: UID/GID, copia del bundle (§5.1) in `/srv/sites/<sito>` (0750),
-`.env` 0600 generato da `.env.example`, pull per digest, avvio (al primo avvio il DB importa
-il dump), vhost nginx su `edge` (§4.1) con `nginx -t` e reload. Nessun DNS toccato.
+Via ssh, idempotente. Nessun DNS toccato.
+
+- **Primo deploy**: UID/GID, copia del bundle (§5.1) in `/srv/sites/<sito>` (0750), `.env`
+  0600 generato da `.env.example`, pull per digest, avvio (con `db/data/` vuota il DB
+  importa il dump), vhost nginx su `edge` (§4.1) con `nginx -t` e reload.
+- **Deploy successivi**: aggiornano solo `compose.yaml`, README e `.env.example`, poi pull
+  per digest e riavvio.
+- I deploy successivi **non** toccano mai `data/` né il DB: nemmeno con `--force`, nemmeno
+  al passo 8 della manutenzione (§4.6). Il DB di produzione si sostituisce solo al
+  cutover (§7.12).
 
 ### 7.11 `verify`
 Via tunnel ssh con header `Host` (niente sottodomini pubblici di staging): status code
@@ -342,11 +366,16 @@ in uploads, nessun egress dal container, utente non root, page cache servita sen
 ### 7.12 `cutover`
 1. TTL dei record web abbassato da almeno 24–48 h (il tool lo verifica).
 2. Sync finale: delta FTP + nuovo dump → scan veloce dei delta.
-3. Vhost nginx del dominio attivo su `edge`: certificato origin presente (modalità
+3. Import esplicito del dump finale (il DB ha già dati, quindi niente import automatico):
+   1. backup restic del DB di destinazione;
+   2. import del nuovo dump pulito in un container effimero sulla rete `<sito>_internal`;
+   3. `wp search-replace` se cambiano gli URL;
+   4. `verify` (§7.11).
+4. Vhost nginx del dominio attivo su `edge`: certificato origin presente (modalità
    `origin-cert`), accesso limitato agli IP della CDN.
-4. **Checklist DNS solo dei record web, mai MX/SPF/DKIM**: il cambio lo fa l'operatore.
-5. Verifica post-switch e certificato.
-6. Sorgente intatta per `cutover.rollback_days`.
+5. **Checklist DNS solo dei record web, mai MX/SPF/DKIM**: il cambio lo fa l'operatore.
+6. Verifica post-switch e certificato.
+7. Sorgente intatta per `cutover.rollback_days`.
 
 ### 7.13 `backup`
 Attivazione restic per il sito e primo test di restore.
