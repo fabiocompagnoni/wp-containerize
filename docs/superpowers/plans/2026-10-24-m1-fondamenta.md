@@ -143,7 +143,7 @@ git switch main && git merge --no-ff chore/scaffolding && git push
     - `version: Literal[1]`
     - `registry` (`host: str = "ghcr.io"`, `namespace: str`)
     - `edge` (`tls: Literal["origin-cert", "http"] = "origin-cert"`, `trusted_proxies: list[str] = []`, `real_ip_header: str | None = None`)
-    - `maintenance` (`enabled: bool = True`, `schedule: str = "0 4 * * *"`, `notify_email: str | None = None`)
+    - `maintenance` (`enabled: bool = True`, `schedule: str = "0 4 * * *"`, `notify: MaintenanceNotify`), dove `MaintenanceNotify` ha `email: str | None = None` e `webhook: bool = False` (l'URL sta in `.env`, `MAINTENANCE_WEBHOOK_URL`)
     - `defaults` (`php: str = "8.5"`, `uid_range: tuple[int, int] = (20000, 29999)`, `limits: Limits`, `cache: CacheSettings`)
     - `scan` (`modified_after: date | None`)
     - `ai_review` (`enabled: bool = False`)
