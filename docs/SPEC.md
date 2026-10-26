@@ -167,31 +167,49 @@ interno (es. supercronic, **[DA VERIFICARE]**). A ogni esecuzione, per ogni sito
    nuova versione del core WordPress, nuove versioni di plugin e temi **del repository
    ufficiale**. Se non c'è nessun aggiornamento, si ferma qui.
 2. Backup del DB (restic) prima di qualunque modifica.
-3. Aggiornamenti applicati in un container `dev` effimero sul codice del sito; unica
-   uscita il proxy di egress con allowlist (`*.wordpress.org`).
+3. Aggiornamenti applicati in un container `dev` effimero sul codice del sito:
+   - unica uscita il proxy `egress`, con allowlist `*.wordpress.org`;
+   - il DB di produzione non viene toccato: `dev` lavora su una copia restaurata dal
+     backup del passo 2, in un MariaDB effimero su una rete isolata;
+   - wp-cli con `--skip-plugins --skip-themes`: il codice appena scaricato non gira prima
+     dello scan del passo 4.
 4. Scan dei file cambiati (checksum ufficiali + euristiche del §7.4): con finding `high`
-   si ferma e notifica.
+   si ferma.
 5. Build in un builder isolato (BuildKit in container, rootless **[DA VERIFICARE]**).
-6. trivy, SBOM e firma (§5).
+6. trivy, SBOM e firma (§5). trivy blocca con la regola del §5 e ferma il ciclo.
 7. Push sul registry.
-8. Deploy per digest, poi `wp core update-db`, poi `verify` (§7.11).
-9. Se `verify` fallisce: **rollback automatico** al digest precedente e restore del DB
-   dal backup del punto 2.
+8. Deploy per digest (§7.10: non tocca `data/` né il DB), poi `wp core update-db` sul DB
+   di produzione, che è la prima modifica a quel DB, poi `verify` (§7.11).
+9. Se `verify` fallisce: **rollback automatico** al digest precedente, restore del DB
+   dal backup del passo 2 e `git revert` del commit automatico.
 10. Notifica all'operatore con l'esito (email via SMTP configurato e/o webhook).
+
+Uno stop ai passi 4–7 (scan `high`, build, trivy, push) lascia la produzione intatta:
+niente è stato deployato e il DB di produzione non è stato toccato. Si notifica e basta.
+
+Il restore del passo 9 **perde i dati scritti** tra il backup e il rollback (ordini,
+commenti).
 
 Regole:
 - Plugin e temi premium o custom **non** si aggiornano da soli: vengono segnalati nel
   report per un `upgrade` manuale.
 - `maintainer` comanda Docker senza il socket grezzo: passa da un proxy dell'API Docker
   ristretto alle chiamate necessarie (es. `docker-socket-proxy`, **[DA VERIFICARE]**).
+  Un filtro solo per endpoint **non basta**: `POST /containers/create` con bind di `/`,
+  `privileged` o `cap_add` equivale a root sull'host. Serve un filtro anche sui parametri
+  (bind, `privileged`, `cap_add`, network, devices) oppure un'alternativa (es. builder
+  rootless separato).
 - Il codice dei siti non gira mai nel container `maintainer`: solo nei container `dev`
   effimeri e nel builder.
 - Il codice aggiornato viene registrato nel repo git del sito (commit automatico con
   l'elenco degli aggiornamenti), così la build resta riproducibile.
   **[DA DEFINIRE nel piano della milestone]**: dove vive il repo del sito sulla VPS e come
   si sincronizza con la macchina dell'operatore.
-- Credenziali di push sul registry e chiave cosign per i punti 6–7 sulla VPS: come
-  arrivano al `maintainer` **[DA DEFINIRE]**.
+- Il `maintainer` firma con una chiave cosign **dedicata**, distinta da quella
+  dell'operatore: una VPS compromessa potrebbe firmare immagini. Firma keyless
+  **[DA DEFINIRE]**.
+- Come arrivano al `maintainer` le credenziali di push sul registry e la sua chiave
+  cosign **[DA DEFINIRE]**.
 - `wp-containerize maintain <sito>|--all [--dry-run]` esegue lo stesso ciclo a mano dalla
   macchina dell'operatore. La sola ricostruzione per una patch PHP è un caso particolare
   di `maintain --all`.
@@ -328,7 +346,9 @@ un bundle **[DA DEFINIRE]**.
 `wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è il
 proxy `egress`, con l'allowlist del sito (`*.wordpress.org` + host dei plugin premium dichiarati),
 configurato sia con `WP_PROXY_*` sia con `HTTP(S)_PROXY`. wp-cli non gira mai su codice
-non ancora scansionato.
+non ancora scansionato. Nella manutenzione (§4.6, passo 3) wp-cli scarica codice nuovo
+prima dello scan, ma con `--skip-plugins --skip-themes` non lo carica: lo scan del passo 4
+avviene prima che quel codice venga eseguito.
 
 ### 7.7 `clean`
 Plugin e temi del repository ufficiale riscaricati puliti; premium/custom solo dopo
@@ -421,7 +441,9 @@ atomici con messaggi brevi in stile Conventional Commits, niente trailer di co-a
 - Come ottenere e aggiornare le liste di IP dei principali CDN (`edge.trusted_proxies`).
 - Scheduler interno del `maintainer` (es. supercronic).
 - BuildKit in container in modalità rootless per il builder isolato della manutenzione.
-- Proxy dell'API Docker per il `maintainer` (es. `docker-socket-proxy`) e insieme minimo
-  di chiamate da consentire.
+- Proxy dell'API Docker per il `maintainer` (es. `docker-socket-proxy`): insieme minimo
+  di chiamate e, soprattutto, filtro sui parametri di `POST /containers/create` (bind,
+  `privileged`, `cap_add`, network, devices). Un filtro solo per endpoint non basta.
+  In alternativa, builder rootless separato.
 - Disponibilità del tag `php:8.5.<patch>-apache` con le ultime patch di sicurezza.
 - Comportamento FTP degli hosting più diffusi (connessioni parallele, FTPS esplicito, `MLSD`).
