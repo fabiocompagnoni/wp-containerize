@@ -2,8 +2,8 @@
 
 Tool CLI open source per migrare siti **WordPress** da hosting condivisi (cPanel,
 CloudPanel, Plesk o qualunque hosting raggiungibile via FTP/SFTP) a stack Docker isolati
-su una VPS, ripulendoli e aggiornandoli lungo la strada. Resta lo strumento di
-manutenzione dei siti migrati: tutto è parametrico e configurabile.
+su una VPS, ripulendoli e aggiornandoli lungo la strada. Dopo il rilascio i siti migrati
+vengono mantenuti aggiornati in automatico (§4.6): tutto è parametrico e configurabile.
 
 Pensato in particolare per i siti **potenzialmente compromessi** (PHP fuori supporto,
 falle sfruttate attivamente): nessun sito arriva in produzione senza essere stato
@@ -12,7 +12,9 @@ analizzato e ripulito.
 ## 0. Ambito
 
 **Dentro**: pipeline automatica per WordPress; hosting di siti statici HTML con un
-template dedicato (estrazione + scansione + build/deploy, niente upgrade).
+template dedicato (estrazione + scansione + build/deploy, niente upgrade); bundle
+portabile per sito, avviabile con `docker compose up` anche senza il tool (§5.1);
+manutenzione automatica dei siti dopo il rilascio (§4.6).
 
 **Fuori**: redirect di dominio, altri CMS, applicazioni PHP custom, posta (il tool non
 tocca mai MX/SPF/DKIM), modifica automatica dei DNS, scelta del provider CDN (il tool
@@ -39,7 +41,7 @@ codice del tool. Tre livelli, nessun valore cablato nel codice:
 
 | File | Contenuto | Da versionare? |
 |---|---|---|
-| `wp-containerize.yml` | registry, VPS, modalità proxy, backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
+| `wp-containerize.yml` | registry, VPS, edge (TLS, IP della CDN), manutenzione, backup, default (PHP, limiti, cache, egress), AI review | sì, in un repo privato dell'operatore |
 | `sites/<dominio>.yml` | manifest del sito: sorgente, inventario, target, sicurezza, stato | sì, privato |
 | `.env` | **tutti** i segreti | **mai** (permessi 600) |
 
@@ -47,7 +49,7 @@ I template Jinja del tool si sovrascrivono copiandoli in `templates/` del proget
 
 ### 2.1 `.env`
 - Chiavi globali: `REGISTRY_USER`, `REGISTRY_TOKEN`, `VPS_SSH_HOST`, `RESTIC_REPOSITORY`,
-  `RESTIC_PASSWORD`, `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, …
+  `RESTIC_PASSWORD`, `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, `MAINTENANCE_WEBHOOK_URL`, …
 - Chiavi per sito: `<SLUG>__<NOME>`. Lo `slug` è **scritto nel manifest** (non ricavato
   dal dominio), così `a-b.com` e `a.b.com` non collidono. Esempi:
   `ESEMPIO_IT__FTP_HOST`, `…__FTP_USER`, `…__FTP_PASSWORD`, `…__FTP_PROTO`
@@ -70,30 +72,62 @@ I template Jinja del tool si sovrascrivono copiandoli in `templates/` del proget
 
 ## 4. Architettura di destinazione
 
-### 4.1 VPS e reverse proxy
-Un IP per tutti i siti; **Traefik** smista per host ai container. Due modalità
-(`proxy.mode` in `wp-containerize.yml`):
+### 4.1 VPS e reverse proxy nginx
+Un IP per tutti i siti. **Tutto lo stack della VPS è in container**: nessun pannello e
+nessun web server sull'host.
 
-- `standalone`: Traefik su 80/443, certificati Let's Encrypt gestiti da Traefik.
-- `behind-proxy`: la VPS ha già un web server su 80/443 (es. CloudPanel, nginx, Caddy)
-  che gestisce TLS. Traefik ascolta **solo su 127.0.0.1** in HTTP e il proxy esistente
-  inoltra a Traefik i domini migrati. Il tool genera la configurazione o la checklist per
-  il proxy esistente (CloudPanel: sito di tipo Reverse Proxy, **[DA VERIFICARE]** via
-  `clpctl`).
-
-In entrambi i casi:
+- Un unico container **`edge`** (nginx) ascolta su 80/443 e smista per `Host` ai
+  container `app` dei siti, raggiunti tramite le reti per sito `<sito>_edge`, elencate nel
+  suo `compose.yaml` generato dal tool (§4.2).
+- Un file di vhost per sito, generato dal tool da un template Jinja in
+  `/srv/infra/edge/conf.d/`, montato **read-only** nel container.
+- Reload: `nginx -t` e poi `nginx -s reload` dentro il container. Se `nginx -t`
+  fallisce, niente reload.
+- I vhost risolvono l'upstream con il resolver DNS di Docker (`resolver 127.0.0.11`) e un
+  upstream in variabile: nginx parte e si ricarica anche se il container `app` di un sito
+  è fermo o non è ancora collegato alla sua rete `<sito>_edge` (la rete esiste sempre,
+  §4.2). Quel sito risponde 502, gli altri restano su.
+- `docker compose up -d` su `edge` ricrea il container quando cambiano le sue reti: breve
+  interruzione su 80/443 **per tutti i siti**. Succede solo al primo deploy e alla
+  rimozione di un sito (§4.2), non ai deploy successivi.
+- `edge` **non** ha accesso al socket Docker.
 - `daemon.json` con `default-address-pools` (es. `10.200.0.0/16` in /24), perché ogni
   sito usa due reti.
-- `wp-config.php` fida di `X-Forwarded-Proto`/`X-Forwarded-For` solo dal proxy.
+- `wp-containerize infra up` genera `/srv/infra/*` dai template e avvia `edge`, `egress`
+  e `maintainer` via ssh; `infra status` ne mostra lo stato.
+
+**TLS gestito dalla CDN**: niente certificati automatici sulla VPS (né Let's Encrypt né
+certbot). Due modalità (`edge.tls` in `wp-containerize.yml`):
+
+- `origin-cert` (default): nginx termina TLS con il **certificato origin** rilasciato
+  dalla CDN, fornito dall'operatore per dominio:
+  `/srv/infra/edge/certs/<dominio>.crt` e `<dominio>.key`, permessi `0600`, mai nei log.
+- `http`: nginx serve solo la porta 80 dietro la CDN. **Sconsigliato**: il tool lo
+  segnala come tale.
+
+In entrambi i casi:
+- Accesso all'origine consentito **solo dagli IP della CDN** (`edge.trusted_proxies`,
+  lista CIDR configurabile). Comportamento con lista vuota **[DA DEFINIRE]**.
+- IP reale del client preso dall'header della CDN (`edge.real_ip_header`, es.
+  `CF-Connecting-IP`) solo per richieste da quegli IP.
+- `wp-config.php` fida di `X-Forwarded-Proto`/`X-Forwarded-For` solo da `edge`.
+- Come si ottengono e si aggiornano le liste di IP dei principali CDN: **[DA VERIFICARE]**.
 
 ```
-/srv/infra/                  traefik, egress, backup runner
-/srv/sites/<sito>/           un sito = una cartella (self-contained)
-  compose.yaml
-  .env                       generato, 0600, owner root
+/srv/infra/
+  edge/                      nginx: compose.yaml, conf.d/ (vhost, read-only), certs/ (0600)
+  egress/                    proxy di egress condiviso, allowlist per sito (§4.2)
+  maintainer/                manutenzione automatica (§4.6)
+  backup/                    runner restic
+/srv/sites/<sito>/           un sito = una cartella = il bundle di `build` (§5.1)
+  compose.yaml               immagine per digest, rete <sito>_edge external
+  compose.local.yaml         override per l'uso fuori dalla VPS (§5.1)
+  .env                       generato da .env.example, 0600, owner root
+  README
   data/uploads/              contenuti utente
   cache/                     page cache
-  db/                        dati MariaDB
+  db/dump.sql.gz             importato solo al primo avvio, con db/data/ vuota
+  db/data/                   dati MariaDB
 ```
 
 ### 4.2 Stack per sito (stesso template in locale e in produzione)
@@ -102,11 +136,29 @@ In entrambi i casi:
   `cap_drop: [ALL]`, `no-new-privileges`, limiti `cpus`/`mem_limit`/`pids_limit`.
   Scrivibili solo `uploads/`, `cache/` e i percorsi in `security.writable_paths`.
   PHP disabilitato in `uploads/` e `cache/`.
-- `db`: **MariaDB dedicato**, volume `db/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
+- `db`: **MariaDB dedicato**, volume `db/data/`, `my.cnf` tarato per bassi consumi, **nessuna porta**.
 - `redis`: **dedicato**, senza persistenza, `maxmemory` configurabile.
-- Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔traefik).
+- Reti: `<sito>_internal` (`internal: true`: app↔db↔redis) e `<sito>_edge` (app↔edge).
+  - `<sito>_edge` è **per sito**: la crea il tool (`deploy`/`infra`) se manca. Il bundle
+    la dichiara `external` con quel nome.
+  - Collegamenti di `edge` persistenti, mai a runtime: il tool genera il `compose.yaml` di
+    `edge` con le reti `<sito>_edge` dei siti con `status.deploy.state` in `running`
+    (deploy in corso) o `done`, ricavate dai manifest e dichiarate `external`. Il sito del
+    primo deploy è quindi già incluso al passo 6 (§7.10).
+  - `deploy`, la rimozione di un sito e `infra up` rigenerano quel compose e applicano
+    `docker compose up -d` su `edge`. Prima di ogni `up -d` il tool crea, in modo
+    idempotente, ogni rete `<sito>_edge` elencata che non esiste ancora: il compose di
+    `edge` non fallisce mai per una rete mancante. Una ricreazione del container `edge`
+    mantiene così tutti i collegamenti.
+  - Rimozione di un sito, in ordine inverso al deploy:
+    1. vhost rimosso, poi `nginx -t` e reload;
+    2. `compose.yaml` di `edge` rigenerato senza la rete del sito e `docker compose up -d`
+       su `edge`;
+    3. solo alla fine, rete `<sito>_edge` eliminata.
+  - Non esiste una rete `edge` condivisa: le app dei siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
-  (`security.egress.allow`); l'email passa da `msmtp` nell'immagine verso l'SMTP
+  (`security.egress.allow`), applicata da un unico container `egress` condiviso
+  (`/srv/infra/egress/`) con ACL per rete di origine; l'email passa da `msmtp` nell'immagine verso l'SMTP
   configurato, unico host:porta consentito.
 
 ### 4.3 Accesso al DB
@@ -127,7 +179,85 @@ Obiettivo: quasi tutte le richieste servite da cache e CDN, container con risors
 restic per sito verso qualunque repository restic (SFTP come Hetzner Storage Box, S3,
 B2, …): dump giornaliero del DB + `data/`, retention configurabile, test di restore periodico.
 
+### 4.6 Manutenzione automatica
+Due momenti distinti: la **preparazione** (pipeline del §7, che porta il sito pulito e
+aggiornato in produzione, §5) e la **manutenzione** dopo il rilascio, descritta qui.
+
+Un container **`maintainer`** in `/srv/infra/maintainer` sulla VPS, con uno scheduler
+interno (es. supercronic, **[DA VERIFICARE]**). A ogni esecuzione, per ogni sito con
+`maintenance.enabled`:
+
+1. Controlla se ci sono: una nuova patch PHP (digest dell'immagine base cambiato), una
+   nuova versione del core WordPress, nuove versioni di plugin e temi **del repository
+   ufficiale**. Se non c'è nessun aggiornamento, si ferma qui.
+2. Backup del DB (restic) prima di qualunque modifica.
+3. Aggiornamenti applicati in un container `dev` effimero sul codice del sito:
+   - unica uscita il proxy `egress`, con allowlist `*.wordpress.org`;
+   - il DB di produzione non viene toccato: `dev` lavora su una copia restaurata dal
+     backup del passo 2, in un MariaDB effimero su una rete isolata;
+   - wp-cli con `--skip-plugins --skip-themes`: il codice appena scaricato non gira prima
+     dello scan del passo 4.
+4. Scan dei file cambiati (checksum ufficiali + euristiche del §7.4): con finding `high`
+   si ferma.
+5. Build in un builder isolato (BuildKit in container, rootless **[DA VERIFICARE]**).
+6. trivy, SBOM e firma (§5). trivy blocca con la regola del §5 e ferma il ciclo.
+7. Push sul registry.
+8. Deploy per digest (§7.10: non tocca `data/` né il DB), poi `wp core update-db` sul DB
+   di produzione, che è la prima modifica a quel DB, poi `verify` (§7.11).
+9. Se `verify` fallisce: **rollback automatico** al digest precedente, restore del DB
+   dal backup del passo 2 e `git revert` del commit automatico.
+10. Notifica all'operatore con l'esito (email via SMTP configurato e/o webhook).
+
+Uno stop ai passi 4–7 (scan `high`, build, trivy, push) lascia la produzione intatta:
+niente è stato deployato e il DB di produzione non è stato toccato. Si notifica e basta.
+
+Il restore del passo 9 **perde i dati scritti** tra il backup e il rollback (ordini,
+commenti).
+
+Regole:
+- Plugin e temi premium o custom **non** si aggiornano da soli: vengono segnalati nel
+  report per un `upgrade` manuale.
+- `maintainer` comanda Docker senza il socket grezzo: passa da un proxy dell'API Docker
+  ristretto alle chiamate necessarie (es. `docker-socket-proxy`, **[DA VERIFICARE]**).
+  Un filtro solo per endpoint **non basta**: `POST /containers/create` con bind di `/`,
+  `privileged` o `cap_add` equivale a root sull'host. Serve un filtro anche sui parametri
+  (bind, `privileged`, `cap_add`, network, devices) oppure un'alternativa (es. builder
+  rootless separato).
+- Il codice dei siti non gira mai nel container `maintainer`: solo nei container `dev`
+  effimeri e nel builder.
+- Il codice aggiornato viene registrato nel repo git del sito (commit automatico con
+  l'elenco degli aggiornamenti), così la build resta riproducibile.
+  **[DA DEFINIRE nel piano della milestone]**: dove vive il repo del sito sulla VPS e come
+  si sincronizza con la macchina dell'operatore.
+- Il `maintainer` firma con una chiave cosign **dedicata**, distinta da quella
+  dell'operatore: una VPS compromessa potrebbe firmare immagini. Firma keyless
+  **[DA DEFINIRE]**.
+- Come arrivano al `maintainer` le credenziali di push sul registry e la sua chiave
+  cosign **[DA DEFINIRE]**.
+- `wp-containerize maintain <sito>|--all [--dry-run]` esegue lo stesso ciclo a mano dalla
+  macchina dell'operatore. La sola ricostruzione per una patch PHP è un caso particolare
+  di `maintain --all`.
+
+Configurazione:
+- `wp-containerize.yml`: `maintenance.enabled` (default `true`), `maintenance.schedule` in
+  sintassi cron (default `"0 4 * * *"`), `maintenance.notify` con `email` (indirizzo,
+  default nessuno) e `webhook` (`true`/`false`, default `false`).
+- L'URL del webhook è un segreto: sta in `.env`, chiave globale `MAINTENANCE_WEBHOOK_URL`.
+- SMTP usato per le notifiche (host, utente, password in `.env`): **[DA DEFINIRE]**.
+- Manifest del sito: `maintenance.enabled` (default `true`), `maintenance.auto_plugins`
+  (default `true`).
+- Manutenzione attiva per un sito solo se `maintenance.enabled` è vero **sia** nel
+  progetto **sia** nel manifest.
+- `auto_plugins: false`: si aggiornano solo PHP/immagine base e core; plugin e temi
+  vengono solo segnalati nel report.
+
 ## 5. Immagini Docker
+
+**Preparazione prima del push.** Un'immagine arriva sul registry solo dopo la pipeline
+completa: analisi dei file attuali della sorgente per compromissioni e codice malevolo
+(`scan`), pulizia (`clean`), aggiornamento di core, plugin e temi **all'ultima versione**
+e di PHP all'ultima patch (`upgrade`). Solo con `scan` e trivy puliti l'immagine viene
+pubblicata. Dopo il rilascio subentra la manutenzione automatica (§4.6).
 
 - Immagine propria, **non** `wordpress` ufficiale (il suo `VOLUME /var/www/html` rende
   il codice scrivibile e persistente tra gli aggiornamenti).
@@ -143,13 +273,41 @@ B2, …): dump giornaliero del DB + `data/`, retention configurabile, test di re
 - `build` esegue **trivy** (blocca su CRITICAL/HIGH con fix disponibile), genera la SBOM
   (syft) e **firma** l'immagine con cosign; push su un **registry OCI privato**
   (es. GHCR). La VPS fa solo pull, **per digest**.
-- Retention delle immagini configurabile. `wp-containerize rebuild --all` ricostruisce
-  tutto quando esce una patch PHP.
+- Retention delle immagini configurabile. Quando esce una patch PHP le immagini si
+  ricostruiscono con `maintain` (§4.6).
 - Template `static`: `httpd:alpine` con i file del sito, read-only.
+
+### 5.1 Bundle portabile
+Oltre all'immagine sul registry, `build` produce `work/<sito>/bundle/`:
+
+```
+compose.yaml                 immagine referenziata per digest, rete `<sito>_edge` external
+compose.local.yaml           override per l'uso fuori dalla VPS
+.env.example                 solo i nomi delle variabili, senza valori
+data/uploads/                ripulito, senza file PHP
+db/dump.sql.gz               dump ripulito
+README                       istruzioni
+```
+
+- Il bundle si avvia su qualunque host Docker, in locale o su una VPS, **anche senza il
+  tool**. Serve l'accesso in pull al registry.
+- Il dump si importa automaticamente **solo al primo avvio**, quando `db/data/` è vuota.
+- Sulla VPS: `docker compose up`. `compose.yaml` dichiara la rete `<sito>_edge` come
+  `external`, con quel nome; la rete esiste già (§4.2).
+- Fuori dalla VPS: `docker compose -f compose.yaml -f compose.local.yaml up`.
+  L'override:
+  - pubblica `app` su `127.0.0.1:<porta>`;
+  - non usa la rete external;
+  - imposta `WP_HOME`/`WP_SITEURL` da env (`wp-config.php` è generato da env).
+- `deploy` copia il bundle via ssh e lo avvia; `local up` usa lo stesso bundle.
+- Non è una fase: il bundle è un artefatto di `build`.
+- In locale gli URL assoluti nei contenuti restano quelli di produzione: se e come
+  eseguire `wp search-replace` **[DA DEFINIRE]**.
 
 ## 6. Manifest per sito
 `sites/<dominio>.yml`: identità (`site`, `slug`, `aliases`, `client`), sorgente,
-inventario (popolato da `discover`), target, sicurezza, cache, verifica, cutover, stato.
+inventario (popolato da `discover`), target, sicurezza, cache, verifica, cutover,
+manutenzione (§4.6), stato.
 Ogni fase scrive gli artefatti in `work/<sito>/<fase>/` e aggiorna `status.<fase>`
 con `state`, `started_at`, `finished_at`, `artifacts` (SHA-256), `notes`.
 Esempio in `docs/site.example.yml`.
@@ -206,11 +364,15 @@ Disattivata di default (`ai_review.enabled`), perché invia codice dei siti all'
 Anthropic: l'operatore la attiva consapevolmente.
 
 ### 7.6 `local up` / `wp`
-Stack del sito in locale su `http://<sito>.localhost`, dati estratti.
-`wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è un
-proxy per sito con allowlist (`*.wordpress.org` + host dei plugin premium dichiarati),
+Stack del sito in locale su `http://<sito>.localhost`, dati estratti. Dopo `build`,
+`local up` avvia lo stesso bundle della produzione (§5.1); cosa avvia prima che esista
+un bundle **[DA DEFINIRE]**.
+`wp-containerize wp <sito> -- …` esegue wp-cli nel container `dev`; l'unica uscita è il
+proxy `egress`, con l'allowlist del sito (`*.wordpress.org` + host dei plugin premium dichiarati),
 configurato sia con `WP_PROXY_*` sia con `HTTP(S)_PROXY`. wp-cli non gira mai su codice
-non ancora scansionato.
+non ancora scansionato. Nella manutenzione (§4.6, passo 3) wp-cli scarica codice nuovo
+prima dello scan, ma con `--skip-plugins --skip-themes` non lo carica: lo scan del passo 4
+avviene prima che quel codice venga eseguito.
 
 ### 7.7 `clean`
 Plugin e temi del repository ufficiale riscaricati puliti; premium/custom solo dopo
@@ -225,12 +387,26 @@ temi/plugin custom). Siti non portabili in tempi ragionevoli:
 `target.legacy_exception: true` con motivazione.
 
 ### 7.9 `build`
-Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5).
+Genera Dockerfile/compose da template, build, trivy, SBOM, firma, push (§5); produce il
+bundle portabile `work/<sito>/bundle/` (§5.1).
 
 ### 7.10 `deploy`
-Via ssh, idempotente: UID/GID, `/srv/sites/<sito>` (0750), `.env` 0600, rsync di `data/`,
-creazione DB, import del dump pulito con `wp search-replace`, pull per digest, avvio, route
-Traefik. Nessun DNS toccato.
+Via ssh, idempotente. Nessun DNS toccato.
+
+- **Primo deploy**, in quest'ordine:
+  1. UID/GID;
+  2. copia del bundle (§5.1) in `/srv/sites/<sito>` (0750);
+  3. rete `<sito>_edge` creata, se manca, prima di `docker compose up`;
+  4. `.env` 0600 generato da `.env.example`;
+  5. pull per digest e avvio (con `db/data/` vuota il DB importa il dump);
+  6. `compose.yaml` di `edge` rigenerato e `docker compose up -d` su `edge` (§4.2);
+  7. vhost nginx su `edge` (§4.1) con `nginx -t` e reload.
+- **Deploy successivi**: aggiornano solo `compose.yaml`, README e `.env.example`, poi pull
+  per digest e riavvio.
+- I deploy successivi **non** toccano mai `data/` né il DB: nemmeno con `--force`, nemmeno
+  al passo 8 della manutenzione (§4.6). Il deploy non sostituisce mai il DB: lo fanno solo
+  l'import esplicito al cutover (§7.12, punto 3) e il restore automatico del passo 9 della
+  manutenzione (§4.6).
 
 ### 7.11 `verify`
 Via tunnel ssh con header `Host` (niente sottodomini pubblici di staging): status code
@@ -240,10 +416,16 @@ in uploads, nessun egress dal container, utente non root, page cache servita sen
 ### 7.12 `cutover`
 1. TTL dei record web abbassato da almeno 24–48 h (il tool lo verifica).
 2. Sync finale: delta FTP + nuovo dump → scan veloce dei delta.
-3. In modalità `behind-proxy`: configurazione del proxy esistente per il dominio.
-4. **Checklist DNS solo dei record web, mai MX/SPF/DKIM**: il cambio lo fa l'operatore.
-5. Verifica post-switch e certificato.
-6. Sorgente intatta per `cutover.rollback_days`.
+3. Import esplicito del dump finale (il DB ha già dati, quindi niente import automatico):
+   1. backup restic del DB di destinazione;
+   2. import del nuovo dump pulito in un container effimero sulla rete `<sito>_internal`;
+   3. `wp search-replace` se cambiano gli URL;
+   4. `verify` (§7.11).
+4. Vhost nginx del dominio attivo su `edge`: certificato origin presente (modalità
+   `origin-cert`), accesso limitato agli IP della CDN.
+5. **Checklist DNS solo dei record web, mai MX/SPF/DKIM**: il cambio lo fa l'operatore.
+6. Verifica post-switch e certificato.
+7. Sorgente intatta per `cutover.rollback_days`.
 
 ### 7.13 `backup`
 Attivazione restic per il sito e primo test di restore.
@@ -258,7 +440,8 @@ wp-containerize run <sito>|--all --until <fase>   # batch, si ferma ai punti di 
 wp-containerize local up|down <sito>
 wp-containerize wp <sito> -- <argomenti wp-cli>
 wp-containerize db <sito>
-wp-containerize rebuild --all
+wp-containerize maintain <sito>|--all [--dry-run]   # manutenzione (§4.6), anche a mano
+wp-containerize infra up|status                    # edge, egress, maintainer sulla VPS
 wp-containerize status [--all] | report <sito> | capacity
 ```
 
@@ -285,6 +468,12 @@ atomici con messaggi brevi in stile Conventional Commits, niente trailer di co-a
 `main` sempre verde e merge `--no-ff` solo con test passati.
 
 ## 12. Da verificare
-- Comando `clpctl` per creare un sito Reverse Proxy su CloudPanel.
+- Come ottenere e aggiornare le liste di IP dei principali CDN (`edge.trusted_proxies`).
+- Scheduler interno del `maintainer` (es. supercronic).
+- BuildKit in container in modalità rootless per il builder isolato della manutenzione.
+- Proxy dell'API Docker per il `maintainer` (es. `docker-socket-proxy`): insieme minimo
+  di chiamate e, soprattutto, filtro sui parametri di `POST /containers/create` (bind,
+  `privileged`, `cap_add`, network, devices). Un filtro solo per endpoint non basta.
+  In alternativa, builder rootless separato.
 - Disponibilità del tag `php:8.5.<patch>-apache` con le ultime patch di sicurezza.
 - Comportamento FTP degli hosting più diffusi (connessioni parallele, FTPS esplicito, `MLSD`).

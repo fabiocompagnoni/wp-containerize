@@ -5,10 +5,14 @@ Tool CLI open source (Apache-2.0) che porta siti WordPress da hosting condivisi
 (cPanel, CloudPanel, Plesk, qualunque hosting FTP/SFTP) a stack `docker compose` isolati
 su una VPS, ripulendoli e aggiornandoli lungo la strada. Pensato anche per siti
 potenzialmente compromessi: nessun sito arriva in produzione senza analisi e pulizia.
+Dopo il rilascio i siti migrati vengono mantenuti aggiornati in automatico dal container
+`maintainer` sulla VPS.
 
 ```
-discover → extract → scan → ai-review → clean → upgrade → build → deploy → verify → cutover → backup
+discover → extract → scan → ai-review → clean → upgrade → build (immagine + bundle) → deploy → verify → cutover → backup
+poi, sulla VPS: maintain (manutenzione automatica)
 ```
+`maintain` non è una fase della pipeline: è un ciclo che gira dopo il rilascio.
 
 Dettagli completi in `docs/SPEC.md`. Esempio di manifest in `docs/site.example.yml`.
 
@@ -47,11 +51,13 @@ src/wp_containerize/
   sources/ftp.py         # mirror FTP/FTPS/SFTP
   wordpress/             # wp-config, checksum, rilevamento
   phases/*.py            # una fase per file
-  templates/wordpress/   # Dockerfile, compose, apache, php.ini, my.cnf, wp-config
+  templates/wordpress/   # Dockerfile, compose (+ compose.local), apache, php.ini, my.cnf, wp-config
   templates/static/
+  templates/edge/        # vhost nginx per sito
+  templates/infra/       # /srv/infra/* generato da `infra up`
   scanners/              # regole YARA, query SQL sospette
   locale/                # traduzioni gettext (en)
-infra/                   # traefik, egress, restic, daemon.json
+infra/                   # edge (nginx), egress, maintainer, restic, daemon.json
 docs/                    # italiano; docs/en/ traduzione inglese (dopo la prima release stabile)
 tests/
 ```

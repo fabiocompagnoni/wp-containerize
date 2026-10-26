@@ -137,11 +137,13 @@ git switch main && git merge --no-ff chore/scaffolding && git push
     - `target: Target` (`php: str | None`, `uid: int`, `legacy_exception: bool = False`, `legacy_reason: str | None`)
     - `security: Security` (`read_only: bool = True`, `writable_paths`, `egress.allow`, `smtp: Smtp | None`, `premium_update_hosts`, `limits: Limits | None`, `trivy_waivers: list[TrivyWaiver]`, dove `TrivyWaiver` ha `id`, `reason`, `expires: date`)
     - `cache: CacheSettings | None`, `verify` (`urls: list[str] = ["/"]`), `cutover` (`ttl_lowered_at: datetime | None`, `rollback_days: int = 14`)
+    - `maintenance: SiteMaintenance` (`enabled: bool = True`, `auto_plugins: bool = True`)
     - `status: dict[Phase, PhaseStatus]`
   - `class ProjectConfig(BaseModel)`:
     - `version: Literal[1]`
     - `registry` (`host: str = "ghcr.io"`, `namespace: str`)
-    - `proxy` (`mode: Literal["standalone", "behind-proxy"] = "standalone"`)
+    - `edge` (`tls: Literal["origin-cert", "http"] = "origin-cert"`, `trusted_proxies: list[str] = []`, `real_ip_header: str | None = None`)
+    - `maintenance` (`enabled: bool = True`, `schedule: str = "0 4 * * *"`, `notify: MaintenanceNotify`), dove `MaintenanceNotify` ha `email: str | None = None` e `webhook: bool = False` (l'URL sta in `.env`, `MAINTENANCE_WEBHOOK_URL`)
     - `defaults` (`php: str = "8.5"`, `uid_range: tuple[int, int] = (20000, 29999)`, `limits: Limits`, `cache: CacheSettings`)
     - `scan` (`modified_after: date | None`)
     - `ai_review` (`enabled: bool = False`)
