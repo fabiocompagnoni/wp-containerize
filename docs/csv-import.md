@@ -1,13 +1,15 @@
 # Formato del CSV di import
 
 `wp-containerize site import-csv <file.csv>` registra più siti in un colpo solo a partire
-da un file CSV. Questo documento descrive il formato accettato.
+da un file CSV. Questo documento descrive il formato accettato e i casi limite.
 
 ## Formato del file
 - Codifica UTF-8, con o senza BOM.
-- Separatore `,` oppure `;`: viene riconosciuto in automatico analizzando le prime righe del
-  file e scegliendo tra i due.
 - La prima riga è l'intestazione con i nomi delle colonne.
+- Separatore `,` oppure `;`: si analizzano i primi 4 KB del file con `csv.Sniffer`,
+  limitato a questi due caratteri. Se lo sniffing fallisce o il file ha una sola colonna,
+  si usa `,`.
+- I nomi di colonna si confrontano ignorando maiuscole e spazi.
 
 ## Colonne
 | Colonna | Obbligatoria | Significato |
@@ -22,19 +24,36 @@ da un file CSV. Questo documento descrive il formato accettato.
 
 Le colonne non elencate vengono ignorate.
 
-## Tipo e categoria
-- Se è presente la colonna `tipo`, prevale su `categoria`.
-- Valori ammessi di `tipo`: `wordpress`, `static`.
-- Valori riconosciuti di `categoria`: `wordpress`, `statico`; `statico` corrisponde al tipo
-  `static`. Le righe con altre categorie vengono saltate e segnalate.
-- Il confronto di questi valori non distingue maiuscole e minuscole e ignora gli spazi
-  (` WordPress ` equivale a `wordpress`).
+## Tipo della riga
+Il tipo di ogni riga si risolve così:
+1. Se `tipo` ha un valore, prevale su `categoria`. Valori ammessi: `wordpress`, `static`.
+   Un valore non ammesso è un errore: la riga viene saltata e segnalata con il suo numero.
+2. Se `tipo` è vuoto o assente, si guarda `categoria`. Valori riconosciuti: `wordpress`,
+   `statico` (che dà il tipo `static`). Con un'altra categoria la riga viene saltata e
+   segnalata come "categoria non gestita"; non è un errore.
+3. Se la riga non ha né `tipo` né `categoria` (colonne assenti o vuote), il tipo è
+   `wordpress`.
+
+Il confronto dei valori non distingue maiuscole e minuscole e ignora gli spazi
+(` WordPress ` equivale a `wordpress`).
+
+## Dominio
+- Prima della validazione il dominio viene normalizzato: spazi rimossi, minuscolo, punto
+  finale tolto, IDN convertito.
+- Un dominio vuoto o non valido è un errore: la riga viene saltata e segnalata con il suo
+  numero, le righe valide vengono comunque importate e il comando esce con codice 1.
+- Se un dominio compare più volte nel file vale la prima occorrenza; le successive vengono
+  segnalate e saltate.
+- Un dominio che ha già un manifest viene saltato e segnalato; non è un errore.
 
 ## Opzioni
-- `--map campo=colonna`: usa nomi di colonna diversi da quelli standard, anche per
-  `dominio`. Si può ripetere, ad esempio `--map dominio=sito --map cliente=ragione_sociale`.
-- `--categoria wordpress,statico`: filtra le righe per categoria. Il default è importare
-  entrambe. `statico` corrisponde al tipo `static`.
+- `--map campo=colonna`: usa nomi di colonna diversi da quelli standard. `campo` è uno dei
+  nomi standard (`dominio`, `categoria`, `tipo`, `cliente`, `source_host`, `php`, `note`);
+  un campo sconosciuto è un errore d'uso (exit 2). Se la colonna mappata non esiste
+  nell'intestazione, l'intero file viene rifiutato (exit 1). L'opzione si può ripetere, ad
+  esempio `--map dominio=sito --map cliente=ragione_sociale`.
+- `--categoria wordpress,statico`: filtra le righe sul tipo risolto. Accetta `wordpress`,
+  `statico` e anche `static`, che sono sinonimi. Il default è importare entrambe.
 
 ## Esempio
 ```csv
