@@ -65,6 +65,11 @@ cutover:
   ttl_lowered_at: null
   rollback_days: 14
 
+maintenance:                  # manutenzione automatica dopo il rilascio (SPEC §4.6)
+  enabled: true               # il container maintainer sulla VPS aggiorna questo sito
+  auto_plugins: true          # aggiorna da solo plugin e temi del repository ufficiale;
+                              # premium e custom restano manuali (`upgrade`)
+
 status:
   discover:  {state: done, finished_at: "2026-10-24T10:12:00+02:00", artifacts: {report: "sha256:..."}}
   extract:   {state: pending}
