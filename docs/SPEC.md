@@ -83,6 +83,12 @@ nessun web server sull'host.
   `/srv/infra/edge/conf.d/`, montato **read-only** nel container.
 - Reload: `nginx -t` e poi `nginx -s reload` dentro il container. Se `nginx -t`
   fallisce, niente reload.
+- I vhost risolvono l'upstream con il resolver DNS di Docker (`resolver 127.0.0.11`) e un
+  upstream in variabile: nginx parte e si ricarica anche se il container `app` di un sito
+  è fermo o la sua rete manca. Quel sito risponde 502, gli altri restano su.
+- `docker compose up -d` su `edge` ricrea il container quando cambiano le sue reti: breve
+  interruzione su 80/443 **per tutti i siti**. Succede solo al primo deploy e alla
+  rimozione di un sito (§4.2), non ai deploy successivi.
 - `edge` **non** ha accesso al socket Docker.
 - `daemon.json` con `default-address-pools` (es. `10.200.0.0/16` in /24), perché ogni
   sito usa due reti.
@@ -135,11 +141,17 @@ In entrambi i casi:
   - `<sito>_edge` è **per sito**: la crea il tool (`deploy`/`infra`) se manca. Il bundle
     la dichiara `external` con quel nome.
   - Collegamenti di `edge` persistenti, mai a runtime: il tool genera il `compose.yaml` di
-    `edge` con tutte le reti `<sito>_edge` dei siti deployati, ricavate dai manifest e
-    dichiarate `external`.
+    `edge` con le reti `<sito>_edge` dei siti con `status.deploy.state` in `running`
+    (deploy in corso) o `done`, ricavate dai manifest e dichiarate `external`. Il sito del
+    primo deploy è quindi già incluso al passo 6 (§7.10).
   - `deploy`, la rimozione di un sito e `infra up` rigenerano quel compose e applicano
     `docker compose up -d` su `edge`. Una ricreazione del container `edge` mantiene così
     tutti i collegamenti.
+  - Rimozione di un sito, in ordine inverso al deploy:
+    1. vhost rimosso, poi `nginx -t` e reload;
+    2. `compose.yaml` di `edge` rigenerato senza la rete del sito e `docker compose up -d`
+       su `edge`;
+    3. solo alla fine, rete `<sito>_edge` eliminata.
   - Non esiste una rete `edge` condivisa: le app dei siti non si vedono tra loro.
 - **Egress** chiuso di default. Uscite consentite solo via allowlist per sito
   (`security.egress.allow`), applicata da un unico container `egress` condiviso
