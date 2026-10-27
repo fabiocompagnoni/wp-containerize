@@ -1,0 +1,88 @@
+# WordPress site behind the edge proxy, which terminates TLS (Cloudflare Full strict)
+# and forwards plain HTTP on the internal <site>_edge network.
+# nginx serves the static files from the site volume (read-only) and passes PHP to PHP-FPM over FastCGI. ${...} values are filled in at startup by envsubst.
+
+upstream php {
+    server wordpress:9000;
+    keepalive 8;
+}
+
+# Health check for Docker, reachable only from inside the container
+server {
+    listen 127.0.0.1:8080;
+    access_log off;
+    location = /healthz { return 200 "ok\n"; }
+    location / { return 404; }
+}
+
+# Any other host name: drop
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
+
+    root /var/www/html;
+    index index.php;
+
+    if ($method_allowed = 0)  { return 405; }
+    if ($bad_bot)             { return 403; }
+
+    include /etc/nginx/snippets/security-headers.conf;
+    include /etc/nginx/snippets/wordpress-deny.conf;
+
+    limit_conn perip ${NGINX_CONN_PER_IP};
+
+    location = /wp-login.php {
+        limit_req zone=login burst=3 nodelay;
+        include /etc/nginx/snippets/fastcgi-wordpress.conf;
+    }
+
+    # REST API and AJAX: stricter than pages, never cached
+    location ^~ /wp-json/ {
+        limit_req zone=api burst=10 nodelay;
+        try_files $uri /index.php?$args;
+    }
+
+    location = /wp-admin/admin-ajax.php {
+        limit_req zone=api burst=10 nodelay;
+        include /etc/nginx/snippets/fastcgi-wordpress.conf;
+    }
+
+    # Static files straight from disk, cached by browsers and Cloudflare
+    location ~* \.(?:css|js|mjs|jpe?g|png|gif|webp|avif|svg|ico|woff2?|ttf|otf|mp4|webm|pdf)$ {
+        try_files $uri =404;
+        expires ${NGINX_CACHE_STATIC_TTL};
+        access_log off;
+        add_header Cache-Control "public" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Pretty permalinks
+    location / {
+        limit_req zone=pages burst=20 nodelay;
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # PHP: page cache for anonymous visitors
+    location ~ \.php$ {
+        limit_req zone=pages burst=20 nodelay;
+        try_files $uri =404;
+        include /etc/nginx/snippets/fastcgi-wordpress.conf;
+
+        fastcgi_cache wordpress;
+        fastcgi_cache_key "$scheme$host$request_uri";
+        fastcgi_cache_bypass $cache_bypass_cookie $cache_bypass_uri;
+        fastcgi_no_cache $cache_bypass_cookie $cache_bypass_uri;
+        fastcgi_cache_valid 200 301 ${NGINX_CACHE_PAGE_TTL};
+        fastcgi_cache_valid 404 1m;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
+        fastcgi_cache_background_update on;
+        fastcgi_cache_lock on;
+        add_header X-Cache-Status $upstream_cache_status always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+}
