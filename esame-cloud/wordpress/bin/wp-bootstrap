@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Entrypoint. On the first start of the web server it prepares the site:
+#   - existing site: wp-content from /import/files, dump from /import/db.sql[.gz],
+#     URL rewritten to WP_HOME, admin passwords reset (old host = compromised)
+#   - no site: fresh install with the WP_TITLE / WP_ADMIN_* settings
+# then enables the Redis object cache and hands over to the official entrypoint.
+set -Eeuo pipefail
+
+DOCROOT=/var/www/html
+IMPORT_DIR=${WP_IMPORT_DIR:-/import}
+MARKER="$DOCROOT/.wp-bootstrap-done"
+IMPORT_DONE="$DOCROOT/.wp-import-done"
+EXTRAS=/usr/src/wp-extras
+
+log() { printf '[bootstrap] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+wp_() { wp --allow-root --path="$DOCROOT" "$@"; }
+
+# Let the official entrypoint copy the core and write wp-config.php, without
+# starting the server: it only acts for php-fpm commands, and -v just prints the version.
+run_official_setup() {
+    docker-entrypoint.sh php-fpm -v >/dev/null
+}
+
+wait_for_db() {
+    local attempt
+    for attempt in $(seq 1 60); do
+        if wp_ db query 'SELECT 1' --skip-column-names >/dev/null 2>&1; then return 0; fi
+        log "waiting for the database ($attempt/60)"
+        sleep 2
+    done
+    die "database not reachable"
+}
+
+copy_import_files() {
+    local src="$IMPORT_DIR/files/wp-content"
+    [ -d "$src" ] || return 0
+    # Only wp-content is taken from the old host: the core always comes from the image.
+    log "copying wp-content from $src"
+    cp -a "$src/." "$DOCROOT/wp-content/"
+}
+
+find_dump() {
+    local candidate
+    for candidate in "$IMPORT_DIR/db.sql" "$IMPORT_DIR/db.sql.gz"; do
+        if [ -f "$candidate" ]; then echo "$candidate"; return 0; fi
+    done
+}
+
+replace_url() {
+    local old_url=$1 old_host new_url=$WP_HOME scheme
+    old_host=${old_url#*://}
+    for scheme in http https; do
+        wp_ search-replace "$scheme://$old_host" "$new_url" \
+            --all-tables-with-prefix --skip-columns=guid --precise --report-changed-only
+    done
+}
+
+set_option() {
+    # wp-cli fails when the value is unchanged: update only when needed
+    if [ "$(wp_ option get "$1")" != "$2" ]; then wp_ option update "$1" "$2"; fi
+}
+
+import_site() {
+    local dump=$1
+    log "importing database dump $(basename "$dump")"
+    if [[ $dump == *.gz ]]; then gunzip -c "$dump" | wp_ db import -; else wp_ db import "$dump"; fi
+    wp_ core is-installed \
+        || die "no WordPress tables found: WORDPRESS_TABLE_PREFIX must match the prefix of the dump"
+    finalize_import
+}
+
+# Separate step: if the container stops after the dump is loaded, the next
+# start completes it instead of skipping it.
+finalize_import() {
+    local old_url ids
+    old_url=$(wp_ option get siteurl)
+    if [ "${old_url%/}" != "${WP_HOME%/}" ]; then
+        log "rewriting URLs: $old_url -> $WP_HOME"
+        replace_url "${old_url%/}"
+    fi
+    # the imported wp-content may bring an object-cache drop-in: drop stale values
+    wp_ cache flush >/dev/null 2>&1 || true
+    set_option home "$WP_HOME"
+    set_option siteurl "$WP_HOME"
+
+    # Credentials from the old host are considered compromised.
+    ids=$(wp_ user list --role=administrator --field=ID)
+    if [ -n "$ids" ]; then
+        # shellcheck disable=SC2086
+        wp_ user reset-password $ids --skip-email
+        log "administrator passwords reset: set new ones with 'wp user update'"
+    fi
+    touch "$IMPORT_DONE"
+}
+
+install_site() {
+    if [ -z "${WP_ADMIN_PASSWORD:-}" ] && [ -f "${WP_ADMIN_PASSWORD_FILE:-}" ]; then
+        WP_ADMIN_PASSWORD=$(cat "$WP_ADMIN_PASSWORD_FILE")
+    fi
+    : "${WP_ADMIN_USER:?WP_ADMIN_USER is required for a new site}"
+    : "${WP_ADMIN_EMAIL:?WP_ADMIN_EMAIL is required for a new site}"
+    : "${WP_ADMIN_PASSWORD:?WP_ADMIN_PASSWORD is required for a new site}"
+    log "installing a new site at $WP_HOME"
+    # password through stdin, not in the process arguments
+    printf '%s\n' "$WP_ADMIN_PASSWORD" | wp_ core install \
+        --url="$WP_HOME" --title="${WP_TITLE:-WordPress}" \
+        --admin_user="$WP_ADMIN_USER" --admin_email="$WP_ADMIN_EMAIL" \
+        --skip-email --prompt=admin_password
+    wp_ rewrite structure '/%postname%/'
+}
+
+configure_site() {
+    local dump
+    dump=$(find_dump)
+    if wp_ core is-installed 2>/dev/null; then
+        if [ -n "$dump" ] && [ ! -e "$IMPORT_DONE" ]; then
+            log "dump already loaded: completing the import"
+            finalize_import
+        else
+            log "WordPress already installed in the database: nothing to import"
+        fi
+        return 0
+    fi
+    if [ -n "$dump" ]; then import_site "$dump"; else install_site; fi
+}
+
+enable_object_cache() {
+    if [ ! -d "$DOCROOT/wp-content/plugins/redis-cache" ]; then
+        cp -a "$EXTRAS/plugins/redis-cache" "$DOCROOT/wp-content/plugins/"
+    fi
+    wp_ plugin activate redis-cache
+    wp_ redis enable --force
+}
+
+bootstrap() {
+    : "${WP_HOME:?WP_HOME is required}"
+    run_official_setup
+    copy_import_files
+    wait_for_db
+    configure_site
+    enable_object_cache
+    wp_ rewrite flush
+    chown -R www-data:www-data "$DOCROOT/wp-content"
+    date -u +%FT%TZ > "$MARKER"
+    log "site ready"
+}
+
+main() {
+    if [ $# -eq 0 ]; then set -- php-fpm; fi
+    # only the PHP-FPM server bootstraps; other commands (updater, one-off wp-cli) run as they are
+    if [ "$1" = php-fpm ] && [ ! -e "$MARKER" ]; then bootstrap; fi
+    exec docker-entrypoint.sh "$@"
+}
+
+main "$@"

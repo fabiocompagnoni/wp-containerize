@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Scheduler of the updater service: runs wp-update every day at UPDATE_TIME
+# (HH:MM in UTC: the image has no timezone data; default 03:00).
+set -Eeuo pipefail
+
+UPDATE_TIME=${UPDATE_TIME:-03:00}
+[[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+    || { echo "[updater] invalid UPDATE_TIME: $UPDATE_TIME (expected HH:MM)" >&2; exit 2; }
+
+while true; do
+    now=$(date +%s)
+    next=$(date -d "today $UPDATE_TIME" +%s)
+    if (( next <= now )); then next=$(date -d "tomorrow $UPDATE_TIME" +%s); fi
+    echo "[updater] next run at $(date -d "@$next" '+%F %T %Z')" >&2
+    sleep $(( next - now ))
+    wp-update || echo "[updater] run finished with errors (exit $?)" >&2
+done

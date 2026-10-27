@@ -1,0 +1,8 @@
+[Unit]
+Description=Backup of the WordPress sites (restic)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/srv/wp/backup.sh run

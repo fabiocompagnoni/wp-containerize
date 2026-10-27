@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# docker compose for one site, with images.env and the site settings.
+# Usage: ./site.sh <site> <docker compose arguments>
+#   ./site.sh esempio up -d          ./site.sh esempio logs -f wordpress
+#   ./site.sh esempio exec updater wp --allow-root plugin list
+set -Eeuo pipefail
+
+cd "$(dirname "$0")"
+. ./lib.sh
+
+[ $# -ge 2 ] || die "usage: $0 <site> <docker compose arguments>"
+name=$1; shift
+valid_site_name "$name" || die "invalid site name: $name"
+env_file="sites/$name/.env"
+[ -f "$env_file" ] || die "$env_file not found (create the site with new-site.sh or migrate-site.sh)"
+[ "$(env_value "$env_file" SITE_NAME)" = "$name" ] || die "SITE_NAME in $env_file is not $name"
+[ -f images.env ] || die "images.env not found: run build.sh and copy it here"
+
+if [ "$1" = up ]; then ensure_edge_network "$name"; fi
+exec docker compose -f compose.yaml --env-file images.env --env-file "$env_file" "$@"

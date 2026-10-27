@@ -1,0 +1,9 @@
+# data, secrets and files generated on each machine
+build.local.env
+sites/
+images.env
+edge/conf.d/
+edge/sites.yaml
+edge/origin-pull-ca.pem
+backup.env
+backup/

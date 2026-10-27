@@ -1,0 +1,62 @@
+# http-level settings, loaded before the site.
+
+server_tokens off;
+client_max_body_size 32m;
+client_body_timeout 15s;
+client_header_timeout 15s;
+send_timeout 30s;
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_min_length 1024;
+gzip_types text/plain text/css text/xml application/xml application/json
+           application/javascript application/rss+xml image/svg+xml font/woff2;
+
+# Real client IP: trusted only when the connection comes from Cloudflare
+include /etc/nginx/cloudflare/realip.conf;
+real_ip_header CF-Connecting-IP;
+
+# 1 when the TCP peer (before realip) is a Cloudflare address
+geo $realip_remote_addr $from_cloudflare {
+    default 0;
+    include /etc/nginx/cloudflare/geo.conf;
+}
+
+# Rate limits per real client IP (Cloudflare absorbs volumetric DDoS, these stop what passes through: scrapers, bots, brute force, API abuse). Rates are per site.
+limit_req_zone $binary_remote_addr zone=pages:10m rate=${NGINX_RATE_PAGES};
+limit_req_zone $binary_remote_addr zone=api:10m   rate=${NGINX_RATE_API};
+limit_req_zone $binary_remote_addr zone=login:10m rate=${NGINX_RATE_LOGIN};
+limit_req_status 429;
+
+# Concurrent connections per client IP
+limit_conn_zone $binary_remote_addr zone=perip:10m;
+limit_conn_status 429;
+
+# Scanners and clients without a User-Agent
+map $http_user_agent $bad_bot {
+    default 0;
+    ""      1;
+    ~*(sqlmap|nikto|nmap|masscan|zgrab|wpscan|acunetix|nessus|dirbuster|gobuster|nuclei) 1;
+}
+
+# Only the methods WordPress needs (DELETE/PUT/PATCH for the REST API)
+map $request_method $method_allowed {
+    default 0;
+    ~^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$ 1;
+}
+
+# Page cache on disk. Bypassed for logged-in users, carts, POST and query strings.
+fastcgi_cache_path /var/cache/nginx/wordpress levels=1:2 keys_zone=wordpress:32m
+                 max_size=${NGINX_CACHE_MAX_SIZE} inactive=60m use_temp_path=off;
+
+map $http_cookie $cache_bypass_cookie {
+    default 0;
+    ~*(wordpress_logged_in|wp-postpass|comment_author|woocommerce_items_in_cart|woocommerce_cart_hash) 1;
+}
+
+map $request_uri $cache_bypass_uri {
+    default 0;
+    ~*^/(wp-admin|wp-login\.php|wp-json|wp-cron\.php|xmlrpc\.php|cart|checkout|my-account) 1;
+    ~*\?  1;
+}

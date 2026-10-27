@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# One update run:
+#   1. backup of database and files
+#   2. update of core, plugins and themes to the latest version
+#   3. checks: core checksums, PHP fatal errors, active plugins, HTTP smoke test,
+#      known vulnerabilities (Wordfence Intelligence)
+#   4. automatic rollback if a check fails, then notification
+set -Eeuo pipefail
+
+DOCROOT=/var/www/html
+BACKUP_ROOT=${WP_BACKUP_DIR:-/backups}
+BACKUP_KEEP=${WP_BACKUP_KEEP:-7}
+WORDPRESS_FPM=${WORDPRESS_FPM:-wordpress:9000}
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+RUN_DIR="$BACKUP_ROOT/$STAMP"
+REPORT="$RUN_DIR/report.txt"
+WARNINGS=()
+
+log()  { printf '[update] %s\n' "$*" | tee -a "$REPORT" >&2; }
+warn() { WARNINGS+=("$*"); log "WARNING: $*"; }
+wp_()  { wp --allow-root --path="$DOCROOT" "$@"; }
+
+backup() {
+    log "backup in $RUN_DIR"
+    wp_ db export "$RUN_DIR/db.sql" --quiet
+    tar -C "$DOCROOT" --exclude=./wp-content/uploads -czf "$RUN_DIR/files.tar.gz" .
+    wp_ plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.before"
+    wp_ core version > "$RUN_DIR/core.before"
+}
+
+vulnerabilities() {
+    # prints the vulnerable components; exit 2 = feed not available
+    local out=$1 rc=0
+    wp-vulncheck > "$out" || rc=$?
+    if (( rc == 2 )); then warn "vulnerability feed not available, check skipped"; return 2; fi
+    return 0
+}
+
+update_all() {
+    log "updating core, plugins and themes"
+    wp_ core update \
+        && wp_ core update-db \
+        && wp_ plugin update --all \
+        && wp_ theme update --all
+}
+
+# Smoke test straight against PHP-FPM (FastCGI), as nginx would call it.
+# PHP-FPM omits the Status header for 200 responses.
+fastcgi_check() {
+    local script=$1 uri=$2 host response status
+    host=${WP_HOME#*://}; host=${host%%/*}
+    response=$(env -i REQUEST_METHOD=GET SERVER_PROTOCOL=HTTP/1.1 \
+        SCRIPT_FILENAME="$DOCROOT/$script" SCRIPT_NAME="/$script" \
+        REQUEST_URI="$uri" QUERY_STRING= DOCUMENT_ROOT="$DOCROOT" \
+        HTTP_HOST="$host" SERVER_NAME="$host" SERVER_PORT=443 HTTPS=on REMOTE_ADDR=127.0.0.1 \
+        timeout 30 cgi-fcgi -bind -connect "$WORDPRESS_FPM" 2>&1) || { log "smoke test $uri: no answer"; return 1; }
+    status=$(printf '%s\n' "$response" | sed -n '1,/^\r\?$/{s/^Status: \([0-9]*\).*/\1/p}' | head -n 1)
+    if [ "${status:-200}" != 200 ]; then log "smoke test $uri: HTTP $status"; return 1; fi
+    if printf '%s' "$response" | grep -qiE 'critical error|fatal error'; then
+        log "smoke test $uri: error message in the page"; return 1
+    fi
+}
+
+check_all() {
+    local ok=0 path new_vulns
+    log "checking the updated site"
+
+    wp_ core verify-checksums || { log "core checksums do not match"; ok=1; }
+    wp_ plugin verify-checksums --all >/dev/null 2>&1 \
+        || warn "some plugin checksums could not be verified (premium or custom plugins?)"
+
+    wp_ eval 'echo "ok\n";' >/dev/null || { log "PHP fatal error while loading WordPress"; ok=1; }
+
+    wp_ plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.after"
+    if ! diff -q "$RUN_DIR/active-plugins.before" "$RUN_DIR/active-plugins.after" >/dev/null; then
+        log "the set of active plugins changed: $(diff "$RUN_DIR/active-plugins.before" "$RUN_DIR/active-plugins.after" | grep '^[<>]' | tr '\n' ' ')"
+        ok=1
+    fi
+
+    fastcgi_check index.php /             || ok=1
+    fastcgi_check wp-login.php /wp-login.php || ok=1
+    fastcgi_check index.php /wp-json/     || ok=1
+
+    if vulnerabilities "$RUN_DIR/vulns.after"; then
+        # a vulnerability that was not there before was introduced by the update
+        new_vulns=$(comm -13 "$RUN_DIR/vulns.before" "$RUN_DIR/vulns.after")
+        if [ -n "$new_vulns" ]; then log "new vulnerabilities after the update:"$'\n'"$new_vulns"; ok=1; fi
+        if [ -s "$RUN_DIR/vulns.after" ]; then
+            warn "known vulnerabilities still present (no fixed version yet): $(cut -f1 "$RUN_DIR/vulns.after" | sort -u | tr '\n' ' ')"
+        fi
+    fi
+    return $ok
+}
+
+rollback() {
+    log "ROLLBACK to the backup $STAMP"
+    wp_ maintenance-mode activate >/dev/null 2>&1 || true
+    find "$DOCROOT" -mindepth 1 -maxdepth 1 ! -name wp-content -exec rm -rf {} +
+    find "$DOCROOT/wp-content" -mindepth 1 -maxdepth 1 ! -name uploads -exec rm -rf {} +
+    tar -C "$DOCROOT" -xzf "$RUN_DIR/files.tar.gz"
+    wp_ db import "$RUN_DIR/db.sql" --quiet
+    wp_ cache flush >/dev/null 2>&1 || true
+    chown -R www-data:www-data "$DOCROOT"
+    wp_ maintenance-mode deactivate >/dev/null 2>&1 || true
+}
+
+notify() {
+    local status=$1 payload
+    log "result: $status"
+    if [ -z "${UPDATE_WEBHOOK_URL:-}" ] && [ -s "${UPDATE_WEBHOOK_URL_FILE:-}" ]; then
+        UPDATE_WEBHOOK_URL=$(tr -d '[:space:]' < "$UPDATE_WEBHOOK_URL_FILE")
+    fi
+    [ -n "${UPDATE_WEBHOOK_URL:-}" ] || return 0
+    payload=$(STATUS="$status" SITE="$WP_HOME" REPORT_FILE="$REPORT" php -r '
+        echo json_encode([
+            "site"   => getenv("SITE"),
+            "status" => getenv("STATUS"),
+            "report" => file_get_contents(getenv("REPORT_FILE")),
+        ]);')
+    curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' \
+        --data "$payload" "$UPDATE_WEBHOOK_URL" >/dev/null || log "notification failed"
+}
+
+prune_backups() {
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' | sort | head -n "-$BACKUP_KEEP" \
+        | xargs -r rm -rf
+}
+
+main() {
+    : "${WP_HOME:?WP_HOME is required}"
+    mkdir -p "$RUN_DIR"
+    chmod 700 "$BACKUP_ROOT" "$RUN_DIR"
+    wp_ core is-installed || { log "WordPress is not installed yet"; exit 1; }
+
+    backup
+    vulnerabilities "$RUN_DIR/vulns.before" || : > "$RUN_DIR/vulns.before"
+
+    if update_all; then
+        chown -R www-data:www-data "$DOCROOT"
+        if check_all; then
+            notify "updated${WARNINGS[*]:+ with warnings}"
+            prune_backups
+            return 0
+        fi
+    else
+        log "the update itself failed"
+    fi
+    rollback
+    notify "rolled back"
+    return 1
+}
+
+main "$@"

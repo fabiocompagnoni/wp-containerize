@@ -1,0 +1,260 @@
+# One stack per site, behind the shared edge proxy. Run through ./site.sh <site> ...
+# Each site lives in sites/<site>/ (html, import, secrets, .env); see new-site.sh.
+# Images come from the registry (images.env, written by build.sh), pinned by digest.
+name: ${SITE_NAME:?set SITE_NAME in the site .env}
+
+x-wordpress-env: &wordpress-env
+  WORDPRESS_DB_HOST: db
+  WORDPRESS_DB_NAME: ${DB_NAME}
+  WORDPRESS_DB_USER: ${DB_USER}
+  WORDPRESS_DB_PASSWORD_FILE: /run/secrets/db_password
+  WORDPRESS_TABLE_PREFIX: ${DB_TABLE_PREFIX:-wp_}
+  WP_HOME: https://${SITE_DOMAIN}
+  # Redis object cache (Redis Object Cache plugin); updates only through the updater
+  WORDPRESS_CONFIG_EXTRA: |
+    define('WP_REDIS_HOST', 'redis');
+    define('WP_REDIS_PORT', 6379);
+    define('WP_REDIS_PASSWORD', trim(file_get_contents('/run/secrets/redis_password')));
+    define('WP_REDIS_PREFIX', '${DB_NAME}:');
+    define('DISALLOW_FILE_EDIT', true);
+    define('AUTOMATIC_UPDATER_DISABLED', true);
+
+services:
+  nginx:
+    image: ${NGINX_IMAGE_REF:?run build.sh and pass images.env}
+    # no "ports": reached only by the edge proxy on the <site>_edge network
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+      NGINX_CACHE_MAX_SIZE: ${NGINX_CACHE_MAX_SIZE:-512m}
+      NGINX_CACHE_PAGE_TTL: ${NGINX_CACHE_PAGE_TTL:-10m}
+      NGINX_CACHE_STATIC_TTL: ${NGINX_CACHE_STATIC_TTL:-7d}
+      NGINX_RATE_PAGES: ${NGINX_RATE_PAGES:-10r/s}
+      NGINX_RATE_API: ${NGINX_RATE_API:-5r/s}
+      NGINX_RATE_LOGIN: ${NGINX_RATE_LOGIN:-5r/m}
+      NGINX_CONN_PER_IP: ${NGINX_CONN_PER_IP:-20}
+    volumes:
+      - nginx_cache:/var/cache/nginx
+      - ./sites/${SITE_NAME}/html:/var/www/html:ro   # static files served directly by nginx
+    tmpfs:
+      - /etc/nginx/conf.d   # rendered templates
+      - /run
+      - /tmp
+    read_only: true
+    # master binds 443 as root, workers switch to the nginx user
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      edge:
+        aliases:
+          - ${SITE_NAME}-web   # unique name for the edge, which joins every site network
+      backend: {}
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${NGINX_CPUS:-0.50}"
+          memory: ${NGINX_MEMORY:-128M}
+
+  wordpress:
+    image: ${WORDPRESS_IMAGE_REF:?run build.sh and pass images.env}
+    environment:
+      <<: *wordpress-env
+      # first start only (see wordpress/bin/wp-bootstrap)
+      PHP_FPM_MAX_CHILDREN: ${PHP_FPM_MAX_CHILDREN:-5}
+      WP_TITLE: ${WP_TITLE:-WordPress}
+      WP_ADMIN_USER: ${WP_ADMIN_USER:-}
+      WP_ADMIN_EMAIL: ${WP_ADMIN_EMAIL:-}
+      WP_ADMIN_PASSWORD_FILE: /run/secrets/wp_admin_password
+    secrets:
+      - db_password
+      - redis_password
+      - wp_admin_password
+    volumes:
+      - ./sites/${SITE_NAME}/html:/var/www/html
+      # existing site to import on the first start: files/wp-content/ and db.sql[.gz]
+      - ./sites/${SITE_NAME}/import:/import:ro
+    networks:
+      - backend
+      - database
+      - cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # ready only after the first-start setup, and PHP-FPM answering its ping
+      test: ["CMD-SHELL", "test -f /var/www/html/.wp-bootstrap-done && SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 | grep -q pong"]
+      interval: 15s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORDPRESS_CPUS:-1.00}"
+          memory: ${WORDPRESS_MEMORY:-256M}
+
+  # Daily updates of core, plugins and themes with checks and automatic rollback (see wordpress/bin/wp-update). The only service with Internet access.
+  updater:
+    image: ${WORDPRESS_IMAGE_REF:?run build.sh and pass images.env}
+    command: ["wp-updater"]
+    environment:
+      <<: *wordpress-env
+      UPDATE_TIME: ${UPDATE_TIME:-03:00}   # UTC
+      WP_BACKUP_KEEP: ${WP_BACKUP_KEEP:-7}
+      WORDFENCE_API_KEY_FILE: /run/secrets/wordfence_api_key
+      UPDATE_WEBHOOK_URL_FILE: /run/secrets/update_webhook_url
+      WP_CLI_CACHE_DIR: /tmp/wp-cli-cache
+    secrets:
+      - db_password
+      - redis_password
+      - wordfence_api_key
+      - update_webhook_url
+    volumes:
+      - ./sites/${SITE_NAME}/html:/var/www/html
+      - wp_backups:/backups
+    tmpfs:
+      - /tmp
+    read_only: true
+    # runs wp-cli as root to keep file ownership consistent: only the file capabilities it needs
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+      - database
+      - cache
+      - egress       # wordpress.org, Wordfence feed, webhook
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${UPDATER_CPUS:-1.00}"
+          memory: ${UPDATER_MEMORY:-768M}
+
+  db:
+    image: ${MARIADB_IMAGE}
+    # no "ports": reachable only from the services on the "database" network
+    user: mysql
+    command: ["mariadbd", "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-128M}"]
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD_FILE: /run/secrets/db_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_AUTO_UPGRADE: "1"
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mariadb/my.cnf:/etc/my.cnf.d/zz-security.cnf:ro
+    tmpfs:
+      - /tmp
+      - /run/mariadb       # UBI image: socket directory
+      - /var/lib/mysql-files
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0.50}"
+          memory: ${DB_MEMORY:-384M}
+
+  redis:
+    image: ${REDIS_IMAGE}
+    user: redis
+    command:
+      - sh
+      - -c
+      - >-
+        printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)" > /tmp/auth.conf
+        && exec redis-server /usr/local/etc/redis/redis.conf --maxmemory ${REDIS_MAXMEMORY:-32mb}
+    secrets:
+      - redis_password
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    tmpfs:
+      - /tmp
+      - /data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - cache
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${REDIS_CPUS:-0.25}"
+          memory: ${REDIS_MEMORY:-48M}
+
+networks:
+  edge:              # created by site.sh / edge.sh, shared only with the edge proxy
+    name: ${SITE_NAME}_edge
+    external: true
+  backend:
+    internal: true
+  database:
+    internal: true
+  cache:
+    internal: true
+  egress:            # Internet access for the updater only
+
+volumes:
+  db_data:
+  wp_backups:
+  nginx_cache:
+
+secrets:
+  db_password:
+    file: ./sites/${SITE_NAME}/secrets/db_password
+  db_root_password:
+    file: ./sites/${SITE_NAME}/secrets/db_root_password
+  redis_password:
+    file: ./sites/${SITE_NAME}/secrets/redis_password
+  wp_admin_password:
+    file: ./sites/${SITE_NAME}/secrets/wp_admin_password
+  wordfence_api_key:
+    file: ./sites/${SITE_NAME}/secrets/wordfence_api_key
+  update_webhook_url:
+    file: ./sites/${SITE_NAME}/secrets/update_webhook_url
