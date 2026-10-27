@@ -1,0 +1,29 @@
+ARG NGINX_IMAGE
+FROM ${NGINX_IMAGE}
+
+# Cloudflare IP ranges, fetched at build time from the official lists:
+#   cloudflare/geo.conf     -> used to accept connections from Cloudflare only
+#   cloudflare/realip.conf  -> real client IP from the CF-Connecting-IP header
+# curl is not in the slim image: needed here and by the health check
+RUN set -eux; \
+    apk add --no-cache curl; \
+    mkdir -p /etc/nginx/cloudflare; \
+    : > /etc/nginx/cloudflare/geo.conf; \
+    : > /etc/nginx/cloudflare/realip.conf; \
+    for list in ips-v4 ips-v6; do \
+        curl -fsS --max-time 30 "https://www.cloudflare.com/$list" -o "/tmp/$list"; \
+        for cidr in $(cat "/tmp/$list"); do \
+            echo "$cidr 1;" >> /etc/nginx/cloudflare/geo.conf; \
+            echo "set_real_ip_from $cidr;" >> /etc/nginx/cloudflare/realip.conf; \
+        done; \
+        rm -f "/tmp/$list"; \
+    done; \
+    test -s /etc/nginx/cloudflare/geo.conf; \
+    rm -f /etc/nginx/conf.d/default.conf
+
+# Templates are rendered with envsubst into /etc/nginx/conf.d at startup (official image feature), so the per-site values come from the environment.
+COPY templates/ /etc/nginx/templates/
+COPY snippets/ /etc/nginx/snippets/
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS -o /dev/null http://127.0.0.1:8080/healthz || exit 1

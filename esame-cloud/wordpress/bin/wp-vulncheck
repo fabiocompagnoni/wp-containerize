@@ -1,0 +1,127 @@
+#!/usr/bin/env php
+<?php
+// Lists the known vulnerabilities that affect the installed WordPress core,
+// plugins and themes, using the Wordfence Intelligence scanner feed.
+// Output, sorted: "<type>:<slug>:<version>\t<vulnerability id>\t<title>"
+// Exit codes: 0 = check done (output may be empty), 2 = feed not available.
+declare(strict_types=1);
+
+ini_set('memory_limit', '-1');
+
+const FEED_URL = 'https://www.wordfence.com/api/intelligence/v3/vulnerabilities/scanner';
+const FEED_MAX_AGE = 6 * 3600;
+const DOCROOT = '/var/www/html';
+
+function fail(string $message): never
+{
+    fwrite(STDERR, "[vulncheck] $message\n");
+    exit(2);
+}
+
+function download_feed(string $cache, string $apiKey): void
+{
+    if ($apiKey === '') {
+        fail('WORDFENCE_API_KEY is not set');
+    }
+    $tmp = $cache . '.tmp';
+    $fh = fopen($tmp, 'wb') ?: fail("cannot write $tmp");
+    $ch = curl_init(FEED_URL);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE => $fh,
+        CURLOPT_HTTPHEADER => ["Authorization: Bearer $apiKey"],
+        CURLOPT_FAILONERROR => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 20,
+        CURLOPT_TIMEOUT => 300,
+    ]);
+    $ok = curl_exec($ch);
+    $error = curl_error($ch);
+    fclose($fh);
+    if ($ok !== true) {
+        unlink($tmp);
+        fail("feed download failed: $error");
+    }
+    chmod($tmp, 0600);
+    rename($tmp, $cache);
+}
+
+/** @return array<string, mixed> */
+function load_feed(): array
+{
+    $cache = getenv('WORDFENCE_FEED_CACHE') ?: '/backups/.wordfence-feed.json';
+    if (!is_file($cache) || filemtime($cache) < time() - FEED_MAX_AGE) {
+        $keyFile = (string) getenv('WORDFENCE_API_KEY_FILE');
+        $apiKey = $keyFile !== '' && is_readable($keyFile)
+            ? trim((string) file_get_contents($keyFile))
+            : (string) getenv('WORDFENCE_API_KEY');
+        download_feed($cache, $apiKey);
+    }
+    try {
+        return json_decode((string) file_get_contents($cache), true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException $e) {
+        fail('invalid feed: ' . $e->getMessage());
+    }
+}
+
+/** @return list<array{string, string, string}> type, slug, version */
+function installed_components(): array
+{
+    $wp = 'wp --allow-root --path=' . escapeshellarg(DOCROOT);
+    $components = [['core', 'wordpress', trim((string) shell_exec("$wp core version"))]];
+    foreach (['plugin', 'theme'] as $type) {
+        $json = (string) shell_exec("$wp $type list --fields=name,version --format=json");
+        foreach (json_decode($json, true) ?: [] as $item) {
+            if (($item['version'] ?? '') !== '') {
+                $components[] = [$type, (string) $item['name'], (string) $item['version']];
+            }
+        }
+    }
+    return $components;
+}
+
+/** @param array<string, mixed> $range */
+function in_range(string $version, array $range): bool
+{
+    $from = (string) ($range['from_version'] ?? '*');
+    $to = (string) ($range['to_version'] ?? '*');
+    $aboveFrom = $from === '*'
+        || version_compare($version, $from, ($range['from_inclusive'] ?? true) ? '>=' : '>');
+    $belowTo = $to === '*'
+        || version_compare($version, $to, ($range['to_inclusive'] ?? true) ? '<=' : '<');
+    return $aboveFrom && $belowTo;
+}
+
+/**
+ * @param array<string, mixed> $feed
+ * @return array<string, list<array{string, array<string, mixed>}>> "type:slug" => [id, software]
+ */
+function index_feed(array $feed): array
+{
+    $index = [];
+    foreach ($feed as $id => $vuln) {
+        if ($vuln['informational'] ?? false) {
+            continue; // no real-world impact according to Wordfence
+        }
+        foreach ($vuln['software'] ?? [] as $software) {
+            $key = ($software['type'] ?? '') . ':' . ($software['slug'] ?? '');
+            $index[$key][] = [(string) $id, $software + ['title' => $vuln['title'] ?? '']];
+        }
+    }
+    return $index;
+}
+
+$index = index_feed(load_feed());
+$lines = [];
+foreach (installed_components() as [$type, $slug, $version]) {
+    foreach ($index["$type:$slug"] ?? [] as [$id, $software]) {
+        foreach ($software['affected_versions'] ?? [] as $range) {
+            if (in_range($version, $range)) {
+                $lines[] = "$type:$slug:$version\t$id\t" . str_replace(["\t", "\n"], ' ', $software['title']);
+                break;
+            }
+        }
+    }
+}
+sort($lines);
+echo $lines ? implode("\n", $lines) . "\n" : '';
+exit(0);
