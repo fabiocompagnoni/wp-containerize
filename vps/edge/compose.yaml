@@ -5,6 +5,10 @@ name: edge
 services:
   edge:
     image: ${EDGE_IMAGE_REF:?run build.sh and pass images.env}
+    container_name: edge
+    hostname: edge
+    labels:
+      wp.service: edge
     ports:
       - "${EDGE_HTTPS_PORT:-443}:443"
     volumes:

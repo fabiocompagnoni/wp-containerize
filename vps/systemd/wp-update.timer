@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily updates of the WordPress sites
+
+[Timer]
+# after the backup (wp-backup.timer, 02:00 UTC)
+OnCalendar=*-*-* 03:00:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

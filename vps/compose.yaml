@@ -3,13 +3,27 @@
 # Images come from the registry (images.env, written by build.sh), pinned by digest.
 name: ${SITE_NAME:?set SITE_NAME in the site .env}
 
+# Public resolvers for the containers that go out to the Internet: Docker's DNS still
+# resolves the service names (db, redis) and forwards the others here, so it works
+# whatever the resolver of the host is.
+x-dns: &dns
+  - ${CONTAINER_DNS_1:-1.1.1.1}
+  - ${CONTAINER_DNS_2:-9.9.9.9}
+
+# Every container says which site it belongs to:
+#   docker ps --filter label=wp.domain=esempio.it
+#   docker ps --format 'table {{.Label "wp.domain"}}\t{{.Names}}\t{{.Status}}'
+x-site-labels: &site-labels
+  wp.site: ${SITE_NAME}
+  wp.domain: ${SITE_DOMAIN}
+
 x-wordpress-env: &wordpress-env
   WORDPRESS_DB_HOST: db
   WORDPRESS_DB_NAME: ${DB_NAME}
   WORDPRESS_DB_USER: ${DB_USER}
   WORDPRESS_DB_PASSWORD_FILE: /run/secrets/db_password
   WORDPRESS_TABLE_PREFIX: ${DB_TABLE_PREFIX:-wp_}
-  WP_HOME: https://${SITE_DOMAIN}
+  WP_HOME: ${SITE_URL:-https://${SITE_DOMAIN}}
   # Redis object cache (Redis Object Cache plugin); updates only through the updater
   WORDPRESS_CONFIG_EXTRA: |
     define('WP_REDIS_HOST', 'redis');
@@ -18,10 +32,17 @@ x-wordpress-env: &wordpress-env
     define('WP_REDIS_PREFIX', '${DB_NAME}:');
     define('DISALLOW_FILE_EDIT', true);
     define('AUTOMATIC_UPDATER_DISABLED', true);
+    // wp-cron runs every 5 minutes from the wp-cron timer (jobs.sh), not during visits
+    define('DISABLE_WP_CRON', true);
 
 services:
   nginx:
     image: ${NGINX_IMAGE_REF:?run build.sh and pass images.env}
+    container_name: ${SITE_NAME}-nginx
+    hostname: ${SITE_NAME}-nginx
+    labels:
+      <<: *site-labels
+      wp.service: nginx
     # no "ports": reached only by the edge proxy on the <site>_edge network
     environment:
       SITE_DOMAIN: ${SITE_DOMAIN}
@@ -54,7 +75,7 @@ services:
       edge:
         aliases:
           - ${SITE_NAME}-web   # unique name for the edge, which joins every site network
-      backend: {}
+      web: {}
     depends_on:
       wordpress:
         condition: service_healthy
@@ -67,6 +88,11 @@ services:
 
   wordpress:
     image: ${WORDPRESS_IMAGE_REF:?run build.sh and pass images.env}
+    container_name: ${SITE_NAME}-wordpress
+    hostname: ${SITE_NAME}-wordpress
+    labels:
+      <<: *site-labels
+      wp.service: wordpress
     environment:
       <<: *wordpress-env
       # first start only (see wordpress/bin/wp-bootstrap)
@@ -84,18 +110,21 @@ services:
       # existing site to import on the first start: files/wp-content/ and db.sql[.gz]
       - ./sites/${SITE_NAME}/import:/import:ro
     networks:
-      - backend
-      - database
-      - cache
+      - web
+      - data
+      - egress       # plugins calling external services (APIs, maps, reviews, licences)
+    dns: *dns
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      # ready only after the first-start setup, and PHP-FPM answering its ping
+      # ready only after the first-start setup, and PHP-FPM answering its ping.
+      # Each ping starts a worker (pm = ondemand): a long interval lets an idle site stay empty.
       test: ["CMD-SHELL", "test -f /var/www/html/.wp-bootstrap-done && SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 | grep -q pong"]
-      interval: 15s
+      interval: 60s
+      start_interval: 5s
       timeout: 5s
       start_period: 300s
       retries: 3
@@ -106,13 +135,19 @@ services:
           cpus: "${WORDPRESS_CPUS:-1.00}"
           memory: ${WORDPRESS_MEMORY:-256M}
 
-  # Daily updates of core, plugins and themes with checks and automatic rollback (see wordpress/bin/wp-update). The only service with Internet access.
+  # Updates of core, plugins and themes with checks and automatic rollback
+  # (see wordpress/bin/wp-update). Not a running service: a one-off job started by
+  # the wp-update timer (jobs.sh update) or by hand with ./site.sh <site> run --rm updater
   updater:
     image: ${WORDPRESS_IMAGE_REF:?run build.sh and pass images.env}
-    command: ["wp-updater"]
+    profiles: ["jobs"]
+    hostname: ${SITE_NAME}-updater
+    labels:
+      <<: *site-labels
+      wp.service: updater
+    command: ["wp-update"]
     environment:
       <<: *wordpress-env
-      UPDATE_TIME: ${UPDATE_TIME:-03:00}   # UTC
       WP_BACKUP_KEEP: ${WP_BACKUP_KEEP:-7}
       WORDFENCE_API_KEY_FILE: /run/secrets/wordfence_api_key
       UPDATE_WEBHOOK_URL_FILE: /run/secrets/update_webhook_url
@@ -138,14 +173,13 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - backend
-      - database
-      - cache
+      - web          # smoke test against PHP-FPM after the updates
+      - data
       - egress       # wordpress.org, Wordfence feed, webhook
+    dns: *dns
     depends_on:
       wordpress:
         condition: service_healthy
-    restart: unless-stopped
     deploy:
       resources:
         limits:
@@ -154,9 +188,14 @@ services:
 
   db:
     image: ${MARIADB_IMAGE}
-    # no "ports": reachable only from the services on the "database" network
+    container_name: ${SITE_NAME}-db
+    hostname: ${SITE_NAME}-db
+    labels:
+      <<: *site-labels
+      wp.service: db
+    # no "ports": reachable only from the services on the "data" network
     user: mysql
-    command: ["mariadbd", "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-128M}"]
+    command: ["mariadbd", "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-64M}"]
     environment:
       MARIADB_DATABASE: ${DB_NAME}
       MARIADB_USER: ${DB_USER}
@@ -179,7 +218,7 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - database
+      - data
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -195,6 +234,11 @@ services:
 
   redis:
     image: ${REDIS_IMAGE}
+    container_name: ${SITE_NAME}-redis
+    hostname: ${SITE_NAME}-redis
+    labels:
+      <<: *site-labels
+      wp.service: redis
     user: redis
     command:
       - sh
@@ -215,7 +259,7 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - cache
+      - data
     healthcheck:
       test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli ping | grep -q PONG"]
       interval: 10s
@@ -229,16 +273,23 @@ services:
           memory: ${REDIS_MEMORY:-48M}
 
 networks:
-  edge:              # created by site.sh / edge.sh, shared only with the edge proxy
+  edge:              # .0/26, created by site.sh / edge.sh (lib.sh), shared only with the edge proxy
     name: ${SITE_NAME}_edge
     external: true
-  backend:
+  web:               # nginx <-> PHP-FPM
     internal: true
-  database:
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET:?set SITE_NET in the site .env}.64/26
+  data:              # PHP-FPM and updater <-> MariaDB, Redis
     internal: true
-  cache:
-    internal: true
-  egress:            # Internet access for the updater only
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET}.128/26
+  egress:            # Internet access for wordpress and the updater
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET}.192/26
 
 volumes:
   db_data:

@@ -1,0 +1,8 @@
+[Unit]
+Description=Updates of the WordPress sites (core, plugins, themes) with checks and rollback
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/srv/wp/jobs.sh update
