@@ -92,6 +92,53 @@ Dopo la verifica, `sites/esempio/import/` si può svuotare per recuperare spazio
 ./site.sh esempio up -d --wait && ./edge.sh
 ```
 
+## Backup
+
+Ogni giorno alle 02:00 UTC, prima degli aggiornamenti, `backup.sh` fa uno snapshot restic
+cifrato per ogni sito sulla Storage Box Hetzner. Ogni snapshot contiene il dump del DB,
+`html/`, `.env` e `secrets/`. La conservazione è di 7 giornalieri, 4 settimanali e 6 mensili.
+
+Una volta sulla VPS:
+
+1. Su Hetzner Robot, nella Storage Box, attiva **SSH support**.
+2. Prepara la configurazione e inizializza il repository:
+
+   ```bash
+   cp backup.env.example backup.env   # RESTIC_REPOSITORY con utente e host della Storage Box
+   ./backup.sh init
+   ```
+
+   `init` genera chiave e password, poi mostra la chiave pubblica.
+3. Caricala da un'altra shell:
+
+   ```bash
+   ssh-copy-id -p 23 -s -f -i backup/id_ed25519.pub u123456@u123456.your-storagebox.de
+   ```
+
+   Poi torna a `init` e premi Invio.
+4. **Copia `backup/restic_password` nel password manager**: senza quella i backup non si leggono.
+5. Attiva il timer e fai subito una prima prova:
+
+   ```bash
+   cp systemd/wp-backup.* /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now wp-backup.timer
+   ./backup.sh run                    # prima prova subito
+   ```
+
+Per controllare e ripristinare:
+
+```bash
+./backup.sh restic snapshots --tag site:esempio
+./backup.sh restic restore latest --tag site:esempio --target /restore   # in backup/restore/
+
+# database
+./site.sh esempio exec -T updater wp --allow-root db import - < backup/restore/dumps/esempio.sql
+./site.sh esempio exec -T updater wp --allow-root cache flush
+
+# file
+rsync -a --delete backup/restore/sites/esempio/html/ sites/esempio/html/
+```
+
 ## Gestione
 
 ```bash
