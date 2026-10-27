@@ -38,8 +38,10 @@ chmod 755 "$site_dir" "$site_dir/html" "$site_dir/import" "$site_dir/import/file
 chmod 700 "$site_dir/secrets"
 
 # --- settings ---------------------------------------------------------------
+site_net=$(free_site_net)
 sed -e "s|^SITE_NAME=.*|SITE_NAME=$name|" \
     -e "s|^SITE_DOMAIN=.*|SITE_DOMAIN=$domain|" \
+    -e "s|^SITE_NET=.*|SITE_NET=$site_net|" \
     -e "s|^ORIGIN_MODE=.*|ORIGIN_MODE=$mode|" \
     -e "s|^WP_ADMIN_USER=.*|WP_ADMIN_USER=$name-admin|" \
     -e "s|^WP_ADMIN_EMAIL=.*|WP_ADMIN_EMAIL=admin@$domain|" \
@@ -65,7 +67,7 @@ if [ "$mode" = test ]; then
 fi
 
 cat <<EOF
-Site "$name" created in $site_dir ($mode mode).
+Site "$name" created in $site_dir ($mode mode, networks $(site_net_prefix "$name").0/24).
 
 Still to do:
 EOF

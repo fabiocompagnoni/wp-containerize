@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Migrates an existing WordPress site from a shared hosting. The source is only read.
 #   1. creates sites/<name> with new-site.sh (kept if it already exists: the script can be rerun)
-#   2. downloads wp-config.php and wp-content over FTP/FTPS/SFTP (lftp in a container)
+#   2. downloads wp-config.php and wp-content over FTP/FTPS/SFTP (lftp in a container),
+#      or extracts wp-content from a local archive of the document root
 #   3. takes the table prefix from wp-config.php, then deletes it (old credentials)
 #   4. checks the dump exported from phpMyAdmin and puts it in import/
 #   5. starts the site (the first start imports the dump, rewrites the URLs and
@@ -9,9 +10,13 @@
 #
 # Usage: ./migrate-site.sh <name> <domain> --host <host> --user <user> --path <docroot>
 #            --dump <db.sql|db.sql.gz> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]
+#        ./migrate-site.sh <name> <domain> --files <docroot.tar[.gz]> --config <wp-config.php>
+#            --dump <db.sql|db.sql.gz> [--test]
 #   --path          remote directory with wp-content, e.g. /public_html
 #   --proto         default ftps (explicit TLS)
 #   --insecure-tls  do not verify the FTPS certificate (shared hosts with a generic one)
+#   --files         archive of the document root, already downloaded (instead of FTP)
+#   --config        the wp-config.php of the site (with --files)
 #   --test          self-signed certificate, no Cloudflare checks (see new-site.sh)
 # The FTP password is asked at the prompt, or read from FTP_PASSWORD: never from argv.
 set -Eeuo pipefail
@@ -20,18 +25,19 @@ cd "$(dirname "$0")"
 . ./lib.sh
 
 usage() {
-    echo "usage: $0 <name> <domain> --host <host> --user <user> --path <docroot> --dump <file> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]" >&2
+    echo "usage: $0 <name> <domain> (--host <host> --user <user> --path <docroot> | --files <archive> --config <wp-config.php>) --dump <file> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]" >&2
     exit 2
 }
 
 [ $# -ge 2 ] || usage
 name=$1 domain=$2; shift 2
-host="" user="" path="" dump="" proto=ftps verify_tls=yes test_flag=()
+host="" user="" path="" files="" config_src="" dump="" proto=ftps verify_tls=yes test_flag=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --host|--user|--path|--dump|--proto)
+        --host|--user|--path|--dump|--proto|--files)
             [ $# -ge 2 ] || usage
             declare "${1#--}=$2"; shift ;;
+        --config) [ $# -ge 2 ] || usage; config_src=$2; shift ;;
         --insecure-tls) verify_tls=no ;;
         --test) test_flag=(--test) ;;
         *) usage ;;
@@ -41,11 +47,16 @@ done
 
 # --- inputs ------------------------------------------------------------------
 valid_site_name "$name" || die "name: lowercase letters, digits and '-' (max 31), not 'edge'"
-[[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?(:[0-9]{1,5})?$ ]] || die "invalid --host"
-[[ $user =~ ^[A-Za-z0-9._@+-]{1,128}$ ]] || die "invalid --user"
-[[ $path =~ ^/[A-Za-z0-9._/-]*$ ]] && [[ $path != *..* ]] || die "invalid --path (absolute, no spaces)"
-path=${path%/}
-case "$proto" in ftp|ftps|sftp) ;; *) die "--proto: ftp, ftps or sftp" ;; esac
+if [ -n "$files" ]; then
+    [ -f "$files" ] || die "archive not found: $files"
+    [ -f "$config_src" ] || die "--config: wp-config.php of the site is required with --files"
+else
+    [[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?(:[0-9]{1,5})?$ ]] || die "invalid --host"
+    [[ $user =~ ^[A-Za-z0-9._@+-]{1,128}$ ]] || die "invalid --user"
+    [[ $path =~ ^/[A-Za-z0-9._/-]*$ ]] && [[ $path != *..* ]] || die "invalid --path (absolute, no spaces)"
+    path=${path%/}
+    case "$proto" in ftp|ftps|sftp) ;; *) die "--proto: ftp, ftps or sftp" ;; esac
+fi
 [ -f "$dump" ] || die "dump not found: $dump"
 [ -f images.env ] || die "images.env not found: run build.sh and copy it here"
 mirror_image=$(env_value images.env MIRROR_IMAGE)
@@ -78,17 +89,29 @@ else
 fi
 
 # --- 2. download -----------------------------------------------------------------
+if [ -n "$files" ]; then
+    log "extracting wp-content from $files"
+    archive_dir=$(cd "$(dirname "$files")" && pwd)
+    docker run --rm -e ARCHIVE="$(basename "$files")" -e OWNER="$(id -u):$(id -g)" \
+        -v "$archive_dir:/source:ro" -v "$PWD/$import_dir:/import" \
+        -v "$PWD/bin/archive-extract.sh:/archive-extract.sh:ro" \
+        --entrypoint /bin/sh "$(env_value images.env WORDPRESS_IMAGE_REF)" /archive-extract.sh
+    cp "$config_src" "$import_dir/wp-config.php"
+    chmod 600 "$import_dir/wp-config.php"
+else
 if [ -z "${FTP_PASSWORD:-}" ]; then
     read -rsp "Password $proto for $user@$host: " FTP_PASSWORD; echo >&2
 fi
 log "downloading from $proto://$host$path"
 # the password reaches the container through the environment, not the command line
-LFTP_PASSWORD=$FTP_PASSWORD docker run --rm \
+# shellcheck disable=SC2046  # two separate --dns options
+LFTP_PASSWORD=$FTP_PASSWORD docker run --rm $(container_dns) \
     -e LFTP_PASSWORD -e FTP_PROTO="$proto" -e FTP_HOST="$host" -e FTP_USER="$user" \
     -e FTP_PATH="$path" -e FTP_VERIFY_TLS="$verify_tls" -e OWNER="$(id -u):$(id -g)" \
     -v "$PWD/$import_dir:/import" -v "$PWD/bin/ftp-mirror.sh:/ftp-mirror.sh:ro" \
     "$mirror_image" /ftp-mirror.sh
 unset FTP_PASSWORD
+fi
 
 wp_content="$import_dir/files/wp-content"
 [ -d "$wp_content/plugins" ] || [ -d "$wp_content/themes" ] \
@@ -126,6 +149,13 @@ cp "$dump" "$target"
 chmod 644 "$target"
 log "dump copied to $target"
 
+# canonical URL: keep the www form if the old site used it
+old_home=$({ dump_cat || true; } | grep -oE -m1 "'home', *'https?://[^']*'" | sed -E "s/.*'https?:\/\/([^'\/]*).*/\1/")
+if [ "$old_home" = "www.$domain" ]; then
+    sed -i "s|^SITE_URL=.*|SITE_URL=https://www.$domain|" "$site_dir/.env"
+    log "canonical URL: https://www.$domain"
+fi
+
 # PHP in uploads is the most common backdoor: nginx never runs it, but check it
 suspicious=$(find "$wp_content/uploads" -type f \( -iname '*.php*' -o -iname '*.phtml' -o -iname '*.phar' \) 2>/dev/null || true)
 if [ -n "$suspicious" ]; then
@@ -146,7 +176,7 @@ log "starting $name (first start: dump import, URL rewrite, password reset)"
 ./edge.sh
 
 log ""
-log "Site $name migrated to https://$domain"
+log "Site $name migrated to $(env_value "$site_dir/.env" SITE_URL | grep . || echo "https://$domain")"
 log "Administrators (passwords reset, set a new one with"
-log "  ./site.sh $name exec updater wp --allow-root user update <login> --prompt=user_pass):"
-./site.sh "$name" exec -T updater wp --allow-root user list --role=administrator --fields=ID,user_login,user_email
+log "  ./site.sh $name exec wordpress wp --allow-root user update <login> --prompt=user_pass --skip-email):"
+./site.sh "$name" exec -T wordpress wp --allow-root user list --role=administrator --fields=ID,user_login,user_email

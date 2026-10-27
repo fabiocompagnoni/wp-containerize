@@ -1,0 +1,7 @@
+[Unit]
+Description=wp-cron of the WordPress sites
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/srv/wp/jobs.sh cron

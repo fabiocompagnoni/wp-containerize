@@ -6,6 +6,7 @@
 # Usage: ./build.sh [--local]
 #   --local  no push: images.env points to the local tags (tests on this machine)
 set -Eeuo pipefail
+shopt -s inherit_errexit   # a failed build inside $(...) stops the script
 
 cd "$(dirname "$0")"
 . ./lib.sh
@@ -33,9 +34,9 @@ build() {
     shift 2
     image="$REGISTRY/wp-$name:$tag"
     log "building $image"
-    docker build --pull -t "$image" "$@" "$context" >&2
+    docker build --pull -t "$image" "$@" "$context" >&2 || return 1
     if [ "$push" = 0 ]; then echo "$image"; return; fi
-    docker push "$image" >&2
+    docker push "$image" >&2 || return 1
     docker inspect --format '{{index .RepoDigests 0}}' "$image"
 }
 

@@ -81,6 +81,10 @@ finalize_import() {
     fi
     # the imported wp-content may bring an object-cache drop-in: drop stale values
     wp_ cache flush >/dev/null 2>&1 || true
+    # cache plugins tied to the old web server do nothing here (nginx has its own cache)
+    if wp_ plugin is-active litespeed-cache 2>/dev/null; then
+        wp_ plugin deactivate litespeed-cache
+    fi
     set_option home "$WP_HOME"
     set_option siteurl "$WP_HOME"
 
@@ -130,7 +134,8 @@ enable_object_cache() {
         cp -a "$EXTRAS/plugins/redis-cache" "$DOCROOT/wp-content/plugins/"
     fi
     wp_ plugin activate redis-cache
-    wp_ redis enable --force
+    # also replaces a drop-in left by another cache plugin (e.g. LiteSpeed)
+    wp_ redis update-dropin
 }
 
 bootstrap() {

@@ -1,12 +1,15 @@
 # WordPress su VPS: siti isolati dietro un unico proxy
 
-```
+```text
 Cloudflare (Full strict) ──443──> edge (nginx)
                                     │  rete <sito>_edge, interna, una per sito
                                     ▼
                     nginx del sito ── wordpress (PHP-FPM) ── db (MariaDB)
                     (rate limit,           │                  redis
-                     regole, cache)     updater (aggiornamenti giornalieri)
+                     regole, cache)     Internet (rete egress)
+
+timer systemd sull'host: wp-cron ogni 5 minuti, backup alle 02:00 UTC,
+aggiornamenti alle 03:00 UTC (updater lanciato come job, poi rimosso)
 ```
 
 - **`edge`**: l'unico container con una porta pubblicata. Fa TLS con il certificato Origin
@@ -16,6 +19,11 @@ Cloudflare (Full strict) ──443──> edge (nginx)
   locale, vanno su GHCR, e la VPS fa solo pull per digest (`images.env`).
 - **File di ogni sito**: in `sites/<sito>/html`; impostazioni in `sites/<sito>/.env`,
   segreti in `sites/<sito>/secrets/`.
+- **Rete di ogni sito**: un blocco fisso `10.200.<SITE_NET>.0/24` diviso in quattro reti
+  (edge, web, data, egress). `new-site.sh` sceglie il primo `SITE_NET` libero: gli indirizzi
+  non dipendono dai pool di Docker, quindi non si sovrappongono alla LAN e non finiscono.
+- **Container identificabili**: `<sito>-nginx`, `<sito>-wordpress`, `<sito>-db`,
+  `<sito>-redis`, con le etichette `wp.site`, `wp.domain` e `wp.service`.
 
 Requisiti sulla VPS: Docker con il plugin Compose, `bash`, `openssl`.
 
@@ -40,6 +48,10 @@ cd /srv/wp
 docker login ghcr.io      # token con permesso read:packages
 # CA di Authenticated Origin Pulls di Cloudflare (la stessa per tutte le zone)
 curl -fsSo edge/origin-pull-ca.pem https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
+
+# wp-cron e aggiornamenti pianificati
+cp systemd/wp-cron.* systemd/wp-update.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now wp-cron.timer wp-update.timer
 ```
 
 Dopo ogni `./build.sh`, ricopia `images.env` sulla VPS, poi riavvia i siti con
@@ -70,7 +82,7 @@ Dopo ogni `./build.sh`, ricopia `images.env` sulla VPS, poi riavvia i siti con
    azzera le password degli amministratori. Imposta quella nuova:
 
    ```bash
-   ./site.sh esempio exec updater wp --allow-root user update <login> --prompt=user_pass
+   ./site.sh esempio exec wordpress wp --allow-root user update <login> --prompt=user_pass --skip-email
    ```
 
 4. Su Cloudflare:
@@ -132,8 +144,8 @@ Per controllare e ripristinare:
 ./backup.sh restic restore latest --tag site:esempio --target /restore   # in backup/restore/
 
 # database
-./site.sh esempio exec -T updater wp --allow-root db import - < backup/restore/dumps/esempio.sql
-./site.sh esempio exec -T updater wp --allow-root cache flush
+./site.sh esempio exec -T wordpress wp --allow-root db import - < backup/restore/dumps/esempio.sql
+./site.sh esempio exec -T wordpress wp --allow-root cache flush
 
 # file
 rsync -a --delete backup/restore/sites/esempio/html/ sites/esempio/html/
@@ -144,15 +156,18 @@ rsync -a --delete backup/restore/sites/esempio/html/ sites/esempio/html/
 ```bash
 ./site.sh esempio ps                          # stato
 ./site.sh esempio logs -f wordpress           # log
-./site.sh esempio exec updater wp-update      # aggiornamento subito (backup, verifiche, rollback)
-./site.sh esempio exec updater wp --allow-root plugin list
+docker ps --filter label=wp.domain=esempio.it # container di un dominio
+./jobs.sh update esempio                      # aggiornamento subito (backup, verifiche, rollback)
+./jobs.sh cron esempio                        # wp-cron subito
+./site.sh esempio exec wordpress wp --allow-root plugin list
 ./edge.sh                                     # rigenera i vhost dopo un cambio di siti
 ./edge.sh --recreate                          # dopo aver sostituito un certificato
 ./remove-site.sh esempio                      # elimina sito, database e file (chiede conferma)
 ```
 
 - **Risorse di ogni sito** (CPU, RAM, worker PHP, buffer di MariaDB): si impostano in
-  `sites/<sito>/.env`, poi `./site.sh <sito> up -d`.
-- **Aggiornamenti giornalieri**: alle `UPDATE_TIME` (UTC).
+  `sites/<sito>/.env`, poi `./site.sh <sito> up -d`. I worker PHP partono solo quando
+  arrivano richieste e si chiudono dopo 10 s di inattività.
+- **Aggiornamenti**: ogni giorno alle 03:00 UTC, un sito alla volta (`wp-update.timer`).
 - **Controllo vulnerabilità**: serve la chiave Wordfence Intelligence in
   `sites/<sito>/secrets/wordfence_api_key`.

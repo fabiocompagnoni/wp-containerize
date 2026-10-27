@@ -7,3 +7,4 @@ edge/sites.yaml
 edge/origin-pull-ca.pem
 backup.env
 backup/
+.jobs-update.lock
