@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Scheduled jobs of the sites, started by the systemd timers in systemd/:
-#   ./jobs.sh cron [<site>...]     due wp-cron events of the running sites (every 5 minutes)
-#   ./jobs.sh update [<site>...]   updates with backup, checks and rollback (daily),
-#                                  one site at a time, see wordpress/bin/wp-update
+#   ./jobs.sh cron [<site>...]     scheduled tasks of the running sites (every 5 minutes):
+#                                  due wp-cron events, or the vtiger cron (vtigercron.php)
+#   ./jobs.sh update [<site>...]   updates of the WordPress sites with backup, checks and
+#                                  rollback (daily), one site at a time, see wordpress/bin/wp-update;
+#                                  vtiger is updated by hand with its patches
 # Without site names every site in sites/ is processed. Exit status 1 if any site failed.
 set -Eeuo pipefail
 
@@ -17,7 +19,19 @@ all_sites() {
 }
 
 is_running() {
-    [ "$(docker inspect -f '{{.State.Running}}' "$1-wordpress" 2>/dev/null)" = true ]
+    [ "$(docker inspect -f '{{.State.Running}}' "$1-nginx" 2>/dev/null)" = true ]
+}
+
+site_type() {
+    local type
+    type=$(env_value "sites/$1/.env" SITE_TYPE)
+    echo "${type:-wordpress}"
+}
+
+# vtiger cron (workflows, reminders, mail converter), as www-data
+vtiger_cron() {
+    ./site.sh "$1" exec -T -u www-data -w /var/www/html app \
+        timeout "$CRON_EVENT_TIMEOUT" php -f vtigercron.php
 }
 
 # wp-cli in the wordpress container, as www-data: files written by cron events
@@ -42,6 +56,10 @@ cmd_cron() {
     local name hook due failed=()
     for name in "$@"; do
         is_running "$name" || continue
+        if [ "$(site_type "$name")" = vtiger ]; then
+            vtiger_cron "$name" >/dev/null || { log "$name: vtiger cron failed"; failed+=("$name"); }
+            continue
+        fi
         due=$(site_wp "$name" cron event list --fields=hook,time --format=csv \
             | awk -F, -v now="$(date +%s)" 'NR > 1 && $2 <= now { print $1 }' | sort -u) \
             || { failed+=("$name"); continue; }
@@ -61,6 +79,7 @@ cmd_update() {
     flock -n 9 || die "another update is running"
     for name in "$@"; do
         if ! is_running "$name"; then log "$name: not running, skipped"; continue; fi
+        [ "$(site_type "$name")" = wordpress ] || continue
         log "$name: updating"
         ./site.sh "$name" run --rm updater || failed+=("$name")
     done
