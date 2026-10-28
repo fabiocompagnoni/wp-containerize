@@ -44,7 +44,8 @@ wordpress=$(build wordpress ./wordpress \
     --build-arg "WORDPRESS_IMAGE=$WORDPRESS_IMAGE" \
     --build-arg "WP_CLI_VERSION=$WP_CLI_VERSION" \
     --build-arg "WP_CLI_SHA512=$WP_CLI_SHA512" \
-    --build-arg "REDIS_CACHE_VERSION=$REDIS_CACHE_VERSION")
+    --build-arg "REDIS_CACHE_VERSION=$REDIS_CACHE_VERSION" \
+    --build-arg "NGINX_HELPER_VERSION=$NGINX_HELPER_VERSION")
 nginx=$(build nginx ./nginx --build-arg "NGINX_IMAGE=$NGINX_IMAGE")
 edge=$(build edge ./edge --build-arg "NGINX_IMAGE=$NGINX_IMAGE")
 vtiger=$(build vtiger ./vtiger --build-arg "VTIGER_PHP_IMAGE=$VTIGER_PHP_IMAGE")

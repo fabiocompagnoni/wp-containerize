@@ -74,7 +74,9 @@ server {
         include /etc/nginx/snippets/fastcgi-wordpress.conf;
 
         fastcgi_cache wordpress;
-        fastcgi_cache_key "$scheme$host$request_uri";
+        # the key Nginx Helper computes to delete a page: md5("https" . "GET" . host . uri).
+        # "https" is literal: TLS ends at the edge, so $scheme is http here.
+        fastcgi_cache_key "https$request_method$host$request_uri";
         fastcgi_cache_bypass $cache_bypass_cookie $cache_bypass_uri;
         fastcgi_no_cache $cache_bypass_cookie $cache_bypass_uri;
         fastcgi_cache_valid 200 301 ${NGINX_CACHE_PAGE_TTL};

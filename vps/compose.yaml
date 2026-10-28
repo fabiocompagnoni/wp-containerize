@@ -34,6 +34,8 @@ x-wordpress-env: &wordpress-env
     define('AUTOMATIC_UPDATER_DISABLED', true);
     // wp-cron runs every 5 minutes from the wp-cron timer (jobs.sh), not during visits
     define('DISABLE_WP_CRON', true);
+    // Nginx Helper deletes the cached pages of a changed post (shared nginx_cache volume)
+    define('RT_WP_NGINX_HELPER_CACHE_PATH', '/var/cache/nginx/wordpress/');
 
 services:
   nginx:
@@ -47,7 +49,8 @@ services:
     environment:
       SITE_DOMAIN: ${SITE_DOMAIN}
       NGINX_CACHE_MAX_SIZE: ${NGINX_CACHE_MAX_SIZE:-512m}
-      NGINX_CACHE_PAGE_TTL: ${NGINX_CACHE_PAGE_TTL:-10m}
+      # pages are deleted from the cache when they change (Nginx Helper): a long TTL is safe
+      NGINX_CACHE_PAGE_TTL: ${NGINX_CACHE_PAGE_TTL:-60m}
       NGINX_CACHE_STATIC_TTL: ${NGINX_CACHE_STATIC_TTL:-7d}
       NGINX_RATE_PAGES: ${NGINX_RATE_PAGES:-10r/s}
       NGINX_RATE_API: ${NGINX_RATE_API:-5r/s}
@@ -61,7 +64,7 @@ services:
       - /run
       - /tmp
     read_only: true
-    # master binds 443 as root, workers switch to the nginx user
+    # master binds port 80 as root, workers switch to www-data (the PHP-FPM user)
     cap_drop:
       - ALL
     cap_add:
@@ -115,6 +118,8 @@ services:
       - ./sites/${SITE_NAME}/html:/var/www/html
       # existing site to import on the first start: files/wp-content/ and db.sql[.gz]
       - ./sites/${SITE_NAME}/import:/import:ro
+      # page cache of nginx: Nginx Helper deletes the pages of a changed post
+      - nginx_cache:/var/cache/nginx
     networks:
       - web
       - data
