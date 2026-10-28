@@ -80,8 +80,13 @@ cmd_update() {
     for name in "$@"; do
         if ! is_running "$name"; then log "$name: not running, skipped"; continue; fi
         [ "$(site_type "$name")" = wordpress ] || continue
+        # backup on the Storage Box first: without it no update (the updater keeps only
+        # a temporary local copy for its own rollback)
+        if ! ./backup.sh run "$name"; then
+            log "$name: backup failed, update skipped"; failed+=("$name"); continue
+        fi
         log "$name: updating"
-        ./site.sh "$name" run --rm updater || failed+=("$name")
+        ./site.sh "$name" run --rm updater </dev/null || failed+=("$name")
     done
     [ ${#failed[@]} -eq 0 ] || die "update failed or rolled back for: ${failed[*]}"
 }
