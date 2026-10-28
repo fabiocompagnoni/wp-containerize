@@ -38,12 +38,18 @@ docker login ghcr.io
 ## 2. Copia sulla VPS
 
 ```bash
-rsync -a --exclude sites/ --exclude edge/conf.d/ --exclude edge/sites.yaml ./ root@<vps>:/srv/wp/
+./host/push.sh root@<vps> -i <chiave ssh>
 ```
 
-Una volta sulla VPS:
+Copia solo script, compose e `images.env`, con permessi normali; non tocca `sites/`,
+`backup/` e `incoming/`. **Mai `chown -R` o `chmod -R` su `/srv/wp`**: in `sites/` ci sono i
+file dei siti, che devono restare di `www-data` (uid 82; 33 per vtiger), altrimenti
+WordPress non può scrivere e chiede le credenziali FTP.
+
+La prima volta, sulla VPS:
 
 ```bash
+/srv/wp/host/setup.sh     # SSH, swap, Docker, aggiornamenti di sicurezza, collegamenti ~/wp e ~/siti
 cd /srv/wp
 docker login ghcr.io      # token con permesso read:packages
 # CA di Authenticated Origin Pulls di Cloudflare (la stessa per tutte le zone)

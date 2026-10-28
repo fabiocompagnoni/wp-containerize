@@ -4,6 +4,7 @@ FROM ${WORDPRESS_IMAGE}
 ARG WP_CLI_VERSION
 ARG WP_CLI_SHA512
 ARG REDIS_CACHE_VERSION
+ARG NGINX_HELPER_VERSION
 
 # mariadb-client: wp-cli db import/export; coreutils/tar: GNU tools used by the scripts;
 # fcgi: health checks and smoke tests against PHP-FPM; msmtp: email through the SMTP of the site (sendmail_path); phpredis: object cache
@@ -22,13 +23,15 @@ RUN set -eux; \
     echo "${WP_CLI_SHA512}  /usr/local/bin/wp" | sha512sum -c -; \
     chmod 0755 /usr/local/bin/wp
 
-# Redis Object Cache plugin, copied into the site at first start (no Internet needed)
+# Plugins copied into the site at first start (no Internet needed): Redis Object Cache
+# (object cache) and Nginx Helper (deletes cached pages when they change, see wp-page-cache)
 RUN set -eux; \
-    curl -fsSL -o /tmp/redis-cache.zip \
-        "https://downloads.wordpress.org/plugin/redis-cache.${REDIS_CACHE_VERSION}.zip"; \
     mkdir -p /usr/src/wp-extras/plugins; \
-    php -r '$z = new ZipArchive(); $z->open("/tmp/redis-cache.zip") === true || exit(1); $z->extractTo("/usr/src/wp-extras/plugins") || exit(1);'; \
-    rm -f /tmp/redis-cache.zip
+    for plugin in "redis-cache.${REDIS_CACHE_VERSION}" "nginx-helper.${NGINX_HELPER_VERSION}"; do \
+        curl -fsSL -o /tmp/plugin.zip "https://downloads.wordpress.org/plugin/${plugin}.zip"; \
+        php -r '$z = new ZipArchive(); $z->open("/tmp/plugin.zip") === true || exit(1); $z->extractTo("/usr/src/wp-extras/plugins") || exit(1);'; \
+        rm -f /tmp/plugin.zip; \
+    done
 
 COPY php/production.ini /usr/local/etc/php/conf.d/zz-production.ini
 COPY php/fpm-pool.conf /usr/local/etc/php-fpm.d/zz-pool.conf

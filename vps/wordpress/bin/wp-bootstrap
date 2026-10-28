@@ -156,8 +156,11 @@ bootstrap() {
     wait_for_db
     configure_site
     enable_object_cache
+    wp-page-cache
     wp_ rewrite flush
-    chown -R www-data:www-data "$DOCROOT/wp-content"
+    # the whole docroot: WordPress writes directly (no FTP prompt) only when the files are
+    # owned by the PHP-FPM user; the core is checked every night by wp-update (checksums)
+    chown -R www-data:www-data "$DOCROOT"
     date -u +%FT%TZ > "$MARKER"
     log "site ready"
 }

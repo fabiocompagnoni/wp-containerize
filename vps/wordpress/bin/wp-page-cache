@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Enables the purge of the nginx page cache in the site with Nginx Helper: copies the
+# plugin from the image if missing, activates it and sets it to delete the cached files of
+# the pages that change (method "unlink files": the cache folder is shared with nginx, see
+# compose.yaml, and nginx writes it as www-data like PHP-FPM).
+# Run by wp-bootstrap at the first start; for a site already running:
+#   ./site.sh <site> exec wordpress wp-page-cache
+set -Eeuo pipefail
+
+DOCROOT=/var/www/html
+EXTRAS=/usr/src/wp-extras
+PLUGIN_DIR="$DOCROOT/wp-content/plugins/nginx-helper"
+
+log() { printf '[page-cache] %s\n' "$*" >&2; }
+# plugins and themes of the site are not loaded: only Nginx Helper and its settings matter
+wp_() { wp --allow-root --path="$DOCROOT" --skip-plugins --skip-themes "$@"; }
+
+if [ ! -d "$PLUGIN_DIR" ]; then
+    cp -a "$EXTRAS/plugins/nginx-helper" "$PLUGIN_DIR"
+    chown -R www-data:www-data "$PLUGIN_DIR"
+fi
+wp_ plugin activate nginx-helper >/dev/null
+
+# purge on: delete the cached files of the changed pages (no HTTP purge module in nginx)
+wp_ eval '
+    $o = get_site_option("rt_wp_nginx_helper_options", array());
+    $o["enable_purge"] = 1;
+    $o["cache_method"] = "enable_fastcgi";
+    $o["purge_method"] = "unlink_files";
+    update_site_option("rt_wp_nginx_helper_options", $o);
+'
+log "Nginx Helper active: cached pages are deleted when they change"
