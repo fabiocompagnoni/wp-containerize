@@ -66,7 +66,8 @@ function load_feed(): array
 /** @return list<array{string, string, string}> type, slug, version */
 function installed_components(): array
 {
-    $wp = 'wp --allow-root --path=' . escapeshellarg(DOCROOT);
+    // plugins and themes are not loaded: their PHP warnings would break the JSON output
+    $wp = 'wp --allow-root --skip-plugins --skip-themes --path=' . escapeshellarg(DOCROOT);
     $components = [['core', 'wordpress', trim((string) shell_exec("$wp core version"))]];
     foreach (['plugin', 'theme'] as $type) {
         $json = (string) shell_exec("$wp $type list --fields=name,version --format=json");

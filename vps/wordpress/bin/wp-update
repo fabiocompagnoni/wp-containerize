@@ -19,12 +19,15 @@ WARNINGS=()
 log()  { printf '[update] %s\n' "$*" | tee -a "$REPORT" >&2; }
 warn() { WARNINGS+=("$*"); log "WARNING: $*"; }
 wp_()  { wp --allow-root --path="$DOCROOT" "$@"; }
+# for values read from the output: without loading plugins and themes, whose PHP
+# warnings would end up in the output
+wp_core() { wp_ --skip-plugins --skip-themes "$@"; }
 
 backup() {
     log "backup in $RUN_DIR"
     wp_ db export "$RUN_DIR/db.sql" --quiet
     tar -C "$DOCROOT" --exclude=./wp-content/uploads -czf "$RUN_DIR/files.tar.gz" .
-    wp_ plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.before"
+    wp_core plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.before"
     wp_ core version > "$RUN_DIR/core.before"
 }
 
@@ -62,7 +65,7 @@ fastcgi_check() {
 }
 
 check_all() {
-    local ok=0 path new_vulns
+    local ok=0 new_vulns
     log "checking the updated site"
 
     wp_ core verify-checksums || { log "core checksums do not match"; ok=1; }
@@ -71,7 +74,7 @@ check_all() {
 
     wp_ eval 'echo "ok\n";' >/dev/null || { log "PHP fatal error while loading WordPress"; ok=1; }
 
-    wp_ plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.after"
+    wp_core plugin list --status=active --field=name | sort > "$RUN_DIR/active-plugins.after"
     if ! diff -q "$RUN_DIR/active-plugins.before" "$RUN_DIR/active-plugins.after" >/dev/null; then
         log "the set of active plugins changed: $(diff "$RUN_DIR/active-plugins.before" "$RUN_DIR/active-plugins.after" | grep '^[<>]' | tr '\n' ' ')"
         ok=1

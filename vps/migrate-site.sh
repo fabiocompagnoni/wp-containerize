@@ -4,19 +4,20 @@
 #   2. downloads wp-config.php and wp-content over FTP/FTPS/SFTP (lftp in a container),
 #      or extracts wp-content from a local archive of the document root
 #   3. takes the table prefix from wp-config.php, then deletes it (old credentials)
-#   4. checks the dump exported from phpMyAdmin and puts it in import/
+#   4. checks the dump (phpMyAdmin, mysqldump, CloudPanel) and puts it in import/,
+#      without the CREATE DATABASE / USE of its single database
 #   5. starts the site (the first start imports the dump, rewrites the URLs and
 #      resets the admin passwords, see wordpress/bin/wp-bootstrap) and adds it to the edge
 #
 # Usage: ./migrate-site.sh <name> <domain> --host <host> --user <user> --path <docroot>
 #            --dump <db.sql|db.sql.gz> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]
-#        ./migrate-site.sh <name> <domain> --files <docroot.tar[.gz]> --config <wp-config.php>
+#        ./migrate-site.sh <name> <domain> --files <docroot.tar[.gz]|.zip> [--config <wp-config.php>]
 #            --dump <db.sql|db.sql.gz> [--test]
 #   --path          remote directory with wp-content, e.g. /public_html
 #   --proto         default ftps (explicit TLS)
 #   --insecure-tls  do not verify the FTPS certificate (shared hosts with a generic one)
 #   --files         archive of the document root, already downloaded (instead of FTP)
-#   --config        the wp-config.php of the site (with --files)
+#   --config        the wp-config.php of the site, when the archive does not contain it
 #   --test          self-signed certificate, no Cloudflare checks (see new-site.sh)
 # The FTP password is asked at the prompt, or read from FTP_PASSWORD: never from argv.
 set -Eeuo pipefail
@@ -25,7 +26,7 @@ cd "$(dirname "$0")"
 . ./lib.sh
 
 usage() {
-    echo "usage: $0 <name> <domain> (--host <host> --user <user> --path <docroot> | --files <archive> --config <wp-config.php>) --dump <file> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]" >&2
+    echo "usage: $0 <name> <domain> (--host <host> --user <user> --path <docroot> | --files <archive> [--config <wp-config.php>]) --dump <file> [--proto ftp|ftps|sftp] [--insecure-tls] [--test]" >&2
     exit 2
 }
 
@@ -49,7 +50,7 @@ done
 valid_site_name "$name" || die "name: lowercase letters, digits and '-' (max 31), not 'edge'"
 if [ -n "$files" ]; then
     [ -f "$files" ] || die "archive not found: $files"
-    [ -f "$config_src" ] || die "--config: wp-config.php of the site is required with --files"
+    [ -z "$config_src" ] || [ -f "$config_src" ] || die "--config: file not found: $config_src"
 else
     [[ $host =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?(:[0-9]{1,5})?$ ]] || die "invalid --host"
     [[ $user =~ ^[A-Za-z0-9._@+-]{1,128}$ ]] || die "invalid --user"
@@ -67,10 +68,10 @@ dump_cat() {
     if [[ $dump == *.gz ]]; then gzip -dc "$dump"; else cat "$dump"; fi
 }
 if [[ $dump == *.gz ]]; then gzip -t "$dump" || die "corrupted gzip: $dump"; fi
-# the dump goes into DB_NAME: a CREATE DATABASE / USE would send it elsewhere
-if { dump_cat || true; } | grep -Eqi -m1 '^(CREATE DATABASE|USE )'; then
-    die "the dump contains CREATE DATABASE / USE: export the tables only from phpMyAdmin"
-fi
+# the dump goes into DB_NAME: the CREATE DATABASE / USE of a single-database dump are
+# dropped when it is copied (step 4), a dump of several databases is refused
+use_count=$({ dump_cat || true; } | grep -Eic '^USE ' || true)
+[ "${use_count:-0}" -le 1 ] || die "the dump contains $use_count databases: export only the site database"
 
 site_dir="sites/$name"
 import_dir="$site_dir/import"
@@ -96,8 +97,11 @@ if [ -n "$files" ]; then
         -v "$archive_dir:/source:ro" -v "$PWD/$import_dir:/import" \
         -v "$PWD/bin/archive-extract.sh:/archive-extract.sh:ro" \
         --entrypoint /bin/sh "$(env_value images.env WORDPRESS_IMAGE_REF)" /archive-extract.sh
-    cp "$config_src" "$import_dir/wp-config.php"
-    chmod 600 "$import_dir/wp-config.php"
+    if [ -n "$config_src" ]; then
+        cp "$config_src" "$import_dir/wp-config.php"
+        chmod 600 "$import_dir/wp-config.php"
+    fi
+    [ -f "$import_dir/wp-config.php" ] || die "no wp-config.php in the archive: pass it with --config"
 else
 if [ -z "${FTP_PASSWORD:-}" ]; then
     read -rsp "Password $proto for $user@$host: " FTP_PASSWORD; echo >&2
@@ -144,10 +148,18 @@ if ! { dump_cat || true; } | grep -Eq -m1 "CREATE TABLE (IF NOT EXISTS )?\`?${pr
     die "no ${prefix}options table in the dump: wrong dump or wrong prefix"
 fi
 rm -f "$import_dir/db.sql" "$import_dir/db.sql.gz"
-if [[ $dump == *.gz ]]; then target="$import_dir/db.sql.gz"; else target="$import_dir/db.sql"; fi
-cp "$dump" "$target"
+target="$import_dir/db.sql.gz"
+# normalised copy:
+#  - CREATE DATABASE / USE of its single database dropped: the dump goes into DB_NAME
+#  - phpMyAdmin export bug on binary defaults (e.g. Wordfence tables), which MariaDB
+#    refuses: DEFAULT x AS `00ff` -> DEFAULT x'00ff'
+binary_defaults=$({ dump_cat || true; } | grep -cE 'DEFAULT x AS `[0-9A-Fa-f]+`' || true)
+dump_cat \
+    | sed -E -e '/^(CREATE DATABASE|USE )/Id' \
+             -e "s/DEFAULT x AS \`([0-9A-Fa-f]+)\`/DEFAULT x'\1'/g" \
+    | gzip -c > "$target"
 chmod 644 "$target"
-log "dump copied to $target"
+log "dump copied to $target (fixed binary defaults: ${binary_defaults:-0})"
 
 # canonical URL: keep the www form if the old site used it
 old_home=$({ dump_cat || true; } | grep -oE -m1 "'home', *'https?://[^']*'" | sed -E "s/.*'https?:\/\/([^'\/]*).*/\1/")

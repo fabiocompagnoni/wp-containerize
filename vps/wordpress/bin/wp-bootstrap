@@ -9,12 +9,16 @@ set -Eeuo pipefail
 DOCROOT=/var/www/html
 IMPORT_DIR=${WP_IMPORT_DIR:-/import}
 MARKER="$DOCROOT/.wp-bootstrap-done"
-IMPORT_DONE="$DOCROOT/.wp-import-done"
+IMPORT_LOADED="$DOCROOT/.wp-import-loaded"   # the whole dump is in the database
+IMPORT_DONE="$DOCROOT/.wp-import-done"       # URLs rewritten, passwords reset
 EXTRAS=/usr/src/wp-extras
 
 log() { printf '[bootstrap] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 wp_() { wp --allow-root --path="$DOCROOT" "$@"; }
+# for values read from the output and for database rewrites: without loading plugins and
+# themes, whose PHP warnings would end up in the output (and whose code need not run)
+wp_core() { wp_ --skip-plugins --skip-themes "$@"; }
 
 # Let the official entrypoint copy the core and write wp-config.php, without
 # starting the server: it only acts for php-fpm commands, and -v just prints the version.
@@ -51,30 +55,33 @@ replace_url() {
     local old_url=$1 old_host new_url=$WP_HOME scheme
     old_host=${old_url#*://}
     for scheme in http https; do
-        wp_ search-replace "$scheme://$old_host" "$new_url" \
+        wp_core search-replace "$scheme://$old_host" "$new_url" \
             --all-tables-with-prefix --skip-columns=guid --precise --report-changed-only
     done
 }
 
 set_option() {
     # wp-cli fails when the value is unchanged: update only when needed
-    if [ "$(wp_ option get "$1")" != "$2" ]; then wp_ option update "$1" "$2"; fi
+    if [ "$(wp_core option get "$1")" != "$2" ]; then wp_core option update "$1" "$2"; fi
 }
 
 import_site() {
     local dump=$1
+    # always from an empty database: a previous attempt may have stopped halfway
+    wp_ db reset --yes >/dev/null
     log "importing database dump $(basename "$dump")"
     if [[ $dump == *.gz ]]; then gunzip -c "$dump" | wp_ db import -; else wp_ db import "$dump"; fi
     wp_ core is-installed \
         || die "no WordPress tables found: WORDPRESS_TABLE_PREFIX must match the prefix of the dump"
+    touch "$IMPORT_LOADED"
     finalize_import
 }
 
-# Separate step: if the container stops after the dump is loaded, the next
+# Separate step: if the container stops after the whole dump is loaded, the next
 # start completes it instead of skipping it.
 finalize_import() {
     local old_url ids
-    old_url=$(wp_ option get siteurl)
+    old_url=$(wp_core option get siteurl)
     if [ "${old_url%/}" != "${WP_HOME%/}" ]; then
         log "rewriting URLs: $old_url -> $WP_HOME"
         replace_url "${old_url%/}"
@@ -89,7 +96,7 @@ finalize_import() {
     set_option siteurl "$WP_HOME"
 
     # Credentials from the old host are considered compromised.
-    ids=$(wp_ user list --role=administrator --field=ID)
+    ids=$(wp_core user list --role=administrator --field=ID)
     if [ -n "$ids" ]; then
         # shellcheck disable=SC2086
         wp_ user reset-password $ids --skip-email
@@ -118,7 +125,11 @@ configure_site() {
     local dump
     dump=$(find_dump)
     if wp_ core is-installed 2>/dev/null; then
-        if [ -n "$dump" ] && [ ! -e "$IMPORT_DONE" ]; then
+        if [ -n "$dump" ] && [ ! -e "$IMPORT_LOADED" ] && [ ! -e "$IMPORT_DONE" ]; then
+            # tables of an import that failed halfway: never take them as a complete site
+            log "previous import incomplete: importing the dump again"
+            import_site "$dump"
+        elif [ -n "$dump" ] && [ ! -e "$IMPORT_DONE" ]; then
             log "dump already loaded: completing the import"
             finalize_import
         else
@@ -151,10 +162,51 @@ bootstrap() {
     log "site ready"
 }
 
+# Email for wp_mail(): PHP's sendmail_path is msmtp, configured here at every start of
+# the web server from SMTP_*. The password is read by msmtp from the secret when it
+# sends, never written in its configuration.
+configure_smtp() {
+    local conf=/etc/msmtprc port=${SMTP_PORT:-587} starttls=on
+    if [ -z "${SMTP_HOST:-}" ]; then
+        rm -f "$conf"
+        log "SMTP not configured: the site cannot send email"
+        return 0
+    fi
+    [[ $SMTP_HOST =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid SMTP_HOST"
+    [[ ${SMTP_USER:-} =~ ^[^[:space:]]+$ ]] || die "SMTP_USER is required with SMTP_HOST"
+    [[ ${SMTP_FROM:-$SMTP_USER} =~ ^[^[:space:]]+@[^[:space:]]+$ ]] || die "invalid SMTP_FROM"
+    [[ $port =~ ^[0-9]+$ ]] || die "invalid SMTP_PORT"
+    [ "$port" != 465 ] || starttls=off   # 465: TLS from the start; 587: STARTTLS
+    cat > "$conf" <<EOF
+defaults
+auth on
+tls on
+tls_starttls $starttls
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile /tmp/msmtp.log
+
+account default
+host $SMTP_HOST
+port $port
+user $SMTP_USER
+passwordeval "cat ${SMTP_PASSWORD_FILE:-/run/secrets/smtp_password}"
+from ${SMTP_FROM:-$SMTP_USER}
+# the authenticated mailbox is always the sender: providers refuse other addresses
+set_from_header on
+allow_from_override off
+EOF
+    chmod 0644 "$conf"
+    log "SMTP: $SMTP_USER via $SMTP_HOST:$port"
+}
+
 main() {
     if [ $# -eq 0 ]; then set -- php-fpm; fi
-    # only the PHP-FPM server bootstraps; other commands (updater, one-off wp-cli) run as they are
-    if [ "$1" = php-fpm ] && [ ! -e "$MARKER" ]; then bootstrap; fi
+    # only the PHP-FPM server bootstraps and sends email; other commands (updater,
+    # one-off wp-cli) run as they are
+    if [ "$1" = php-fpm ]; then
+        configure_smtp
+        [ -e "$MARKER" ] || bootstrap
+    fi
     exec docker-entrypoint.sh "$@"
 }
 
