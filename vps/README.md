@@ -104,6 +104,32 @@ Dopo la verifica, `sites/esempio/import/` si può svuotare per recuperare spazio
 ./site.sh esempio up -d --wait && ./edge.sh
 ```
 
+## Email
+
+WordPress invia le email (moduli, notifiche, reset password) con msmtp tramite l'SMTP
+autenticato di una casella del sito, sulla porta 587: Hetzner blocca 25 e 465 in uscita.
+MX, SPF e DKIM restano dove sono.
+
+1. In `sites/esempio/.env`: `SMTP_HOST`, `SMTP_USER` (l'indirizzo della casella),
+   `SMTP_FROM` se il mittente è diverso. Per le caselle Aruba l'host è `mail.postassl.it`:
+   `smtp.arubabusiness.it` presenta un certificato `*.postassl.it` e msmtp lo rifiuta, mentre
+   `smtps.aruba.it` risponde `535` a queste caselle.
+2. La password in `sites/esempio/secrets/smtp_password`, senza che resti nella cronologia:
+
+   ```bash
+   read -rsp "Password SMTP: " p && printf '%s' "$p" > sites/esempio/secrets/smtp_password && unset p
+   ```
+
+3. `./site.sh esempio up -d`, poi una prova:
+
+   ```bash
+   ./site.sh esempio exec -u www-data wordpress wp eval 'var_dump(wp_mail("tu@example.com", "Prova", "Funziona"));'
+   ./site.sh esempio exec wordpress cat /tmp/msmtp.log
+   ```
+
+Il mittente di ogni messaggio è sempre la casella autenticata: il provider rifiuta gli
+altri indirizzi. La risposta ai moduli arriva comunque al visitatore tramite `Reply-To`.
+
 ## Backup
 
 Ogni giorno alle 02:00 UTC, prima degli aggiornamenti, `backup.sh` fa uno snapshot restic

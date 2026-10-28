@@ -1,0 +1,176 @@
+# vtiger CRM site, behind the shared edge proxy. Run through ./site.sh <site> ...
+# (SITE_TYPE=vtiger in sites/<site>/.env): paths are relative to the vps/ directory.
+# Same layout as the WordPress sites: fixed networks, labels, secrets, backups.
+name: ${SITE_NAME:?set SITE_NAME in the site .env}
+
+x-site-labels: &site-labels
+  wp.site: ${SITE_NAME}
+  wp.domain: ${SITE_DOMAIN}
+  wp.type: vtiger
+
+x-dns: &dns
+  - ${CONTAINER_DNS_1:-1.1.1.1}
+  - ${CONTAINER_DNS_2:-9.9.9.9}
+
+services:
+  nginx:
+    image: ${NGINX_IMAGE_REF:?run build.sh and pass images.env}
+    container_name: ${SITE_NAME}-nginx
+    hostname: ${SITE_NAME}-nginx
+    labels:
+      <<: *site-labels
+      wp.service: nginx
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+      NGINX_RATE_PAGES: ${NGINX_RATE_PAGES:-10r/s}
+      NGINX_RATE_API: ${NGINX_RATE_API:-5r/s}
+      NGINX_CONN_PER_IP: ${NGINX_CONN_PER_IP:-20}
+    volumes:
+      # vtiger configuration in place of the WordPress templates of the image
+      - ./vtiger/nginx/templates:/etc/nginx/templates:ro
+      - ./vtiger/nginx/snippets/fastcgi-vtiger.conf:/etc/nginx/snippets/fastcgi-vtiger.conf:ro
+      - ./sites/${SITE_NAME}/html:/var/www/html:ro   # static files served directly by nginx
+    tmpfs:
+      - /etc/nginx/conf.d   # rendered templates
+      - /var/cache/nginx
+      - /run
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      edge:
+        aliases:
+          - ${SITE_NAME}-web   # unique name for the edge, which joins every site network
+      web: {}
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${NGINX_CPUS:-0.50}"
+          memory: ${NGINX_MEMORY:-128M}
+
+  app:
+    image: ${VTIGER_IMAGE_REF:?run build.sh and pass images.env}
+    container_name: ${SITE_NAME}-vtiger
+    hostname: ${SITE_NAME}-vtiger
+    labels:
+      <<: *site-labels
+      wp.service: app
+    environment:
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      PHP_FPM_MAX_CHILDREN: ${PHP_FPM_MAX_CHILDREN:-4}
+    secrets:
+      - db_password
+    volumes:
+      - ./sites/${SITE_NAME}/html:/var/www/html
+      # CRM to import on the first start: db.sql[.gz]
+      - ./sites/${SITE_NAME}/import:/import:ro
+    networks:
+      - web
+      - data
+      - egress       # mail servers (SMTP, IMAP of the mail converter), external services
+    dns: *dns
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # ready only after the first-start setup, and PHP-FPM answering its ping.
+      # Each ping starts a worker (pm = ondemand): a long interval lets an idle site stay empty.
+      test: ["CMD-SHELL", "test -f /var/www/html/.vtiger-bootstrap-done && SCRIPT_NAME=/ping SCRIPT_FILENAME=/ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 | grep -q pong"]
+      interval: 60s
+      start_interval: 5s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORDPRESS_CPUS:-1.00}"
+          memory: ${WORDPRESS_MEMORY:-512M}
+
+  db:
+    image: ${MARIADB_IMAGE}
+    container_name: ${SITE_NAME}-db
+    hostname: ${SITE_NAME}-db
+    labels:
+      <<: *site-labels
+      wp.service: db
+    # no "ports": reachable only from the services on the "data" network
+    user: mysql
+    command: ["mariadbd", "--innodb-buffer-pool-size=${DB_BUFFER_POOL:-128M}"]
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD_FILE: /run/secrets/db_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_AUTO_UPGRADE: "1"
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./vtiger/mariadb/my.cnf:/etc/my.cnf.d/zz-vtiger.cnf:ro
+    tmpfs:
+      - /tmp
+      - /run/mariadb       # UBI image: socket directory
+      - /var/lib/mysql-files
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0.50}"
+          memory: ${DB_MEMORY:-256M}
+
+networks:
+  edge:              # .0/26, created by site.sh / edge.sh (lib.sh), shared only with the edge proxy
+    name: ${SITE_NAME}_edge
+    external: true
+  web:               # nginx <-> PHP-FPM
+    internal: true
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET:?set SITE_NET in the site .env}.64/26
+  data:              # PHP-FPM <-> MariaDB
+    internal: true
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET}.128/26
+  egress:            # Internet access for the CRM
+    ipam:
+      config:
+        - subnet: ${NET_PREFIX:-10.200}.${SITE_NET}.192/26
+
+volumes:
+  db_data:
+
+secrets:
+  db_password:
+    file: ./sites/${SITE_NAME}/secrets/db_password
+  db_root_password:
+    file: ./sites/${SITE_NAME}/secrets/db_root_password

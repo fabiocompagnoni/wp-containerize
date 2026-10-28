@@ -5,25 +5,29 @@
 #   sites/<name>/html/      WordPress files (filled at the first start)
 #   sites/<name>/import/    optional: files/wp-content/ and db.sql[.gz] of a site to migrate
 #
-# Usage: ./new-site.sh <name> <domain> [--test]
+# Usage: ./new-site.sh <name> <domain> [--test] [--type wordpress|vtiger]
 #   --test  self-signed certificate and no Cloudflare checks (local VM)
+#   --type  application of the site (default wordpress), see site.sh
 set -Eeuo pipefail
 
 cd "$(dirname "$0")"
 . ./lib.sh
 
-usage() { echo "usage: $0 <name> <domain> [--test]" >&2; exit 2; }
+usage() { echo "usage: $0 <name> <domain> [--test] [--type wordpress|vtiger]" >&2; exit 2; }
 
 [ $# -ge 2 ] || usage
 name=$1 domain=$2; shift 2
-mode=cloudflare
+mode=cloudflare type=wordpress
 while [ $# -gt 0 ]; do
     case "$1" in
         --test) mode=test ;;
+        --type) [ $# -ge 2 ] || usage; type=$2; shift ;;
         *) usage ;;
     esac
     shift
 done
+case "$type" in wordpress|vtiger) ;; *) die "--type: wordpress or vtiger" ;; esac
+db_name=$type   # database and its user are named after the application
 
 valid_site_name "$name" || die "name: lowercase letters, digits and '-' (max 31), not 'edge'"
 [[ $domain =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]] || die "invalid domain: $domain"
@@ -42,6 +46,9 @@ site_net=$(free_site_net)
 sed -e "s|^SITE_NAME=.*|SITE_NAME=$name|" \
     -e "s|^SITE_DOMAIN=.*|SITE_DOMAIN=$domain|" \
     -e "s|^SITE_NET=.*|SITE_NET=$site_net|" \
+    -e "s|^SITE_TYPE=.*|SITE_TYPE=$type|" \
+    -e "s|^DB_NAME=.*|DB_NAME=$db_name|" \
+    -e "s|^DB_USER=.*|DB_USER=$db_name|" \
     -e "s|^ORIGIN_MODE=.*|ORIGIN_MODE=$mode|" \
     -e "s|^WP_ADMIN_USER=.*|WP_ADMIN_USER=$name-admin|" \
     -e "s|^WP_ADMIN_EMAIL=.*|WP_ADMIN_EMAIL=admin@$domain|" \
@@ -58,6 +65,7 @@ secret redis_password "$(random_password)"
 secret wp_admin_password "$(random_password)"
 secret wordfence_api_key ""
 secret update_webhook_url ""
+secret smtp_password ""
 
 if [ "$mode" = test ]; then
     openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=$domain" \

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Entrypoint of the vtiger image. On the first start of PHP-FPM, for a migrated CRM:
+#   - imports /import/db.sql[.gz] into the site database, always from an empty database
+#     (an import that stopped halfway is never taken as complete)
+#   - gives the files to www-data (vtiger writes in storage/, cache/, logs/, test/,
+#     user_privileges/ and, with the module manager, in modules/ and layouts/)
+# then hands over to the official entrypoint. config.inc.php is prepared by migrate-vtiger.sh.
+set -Eeuo pipefail
+
+DOCROOT=/var/www/html
+IMPORT_DIR=/import
+MARKER="$DOCROOT/.vtiger-bootstrap-done"
+IMPORT_LOADED="$DOCROOT/.vtiger-import-loaded"   # the whole dump is in the database
+
+log() { printf '[bootstrap] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+: "${DB_NAME:?DB_NAME is required}"
+: "${DB_USER:?DB_USER is required}"
+
+# MariaDB client as the site user; the password stays out of the process arguments
+db() {
+    MYSQL_PWD=$(cat /run/secrets/db_password) mariadb -h db -u "$DB_USER" "$@"
+}
+
+wait_for_db() {
+    local attempt
+    for attempt in $(seq 1 60); do
+        if db -e 'SELECT 1' >/dev/null 2>&1; then return 0; fi
+        log "waiting for the database ($attempt/60)"
+        sleep 2
+    done
+    die "database not reachable"
+}
+
+find_dump() {
+    local candidate
+    for candidate in "$IMPORT_DIR/db.sql.gz" "$IMPORT_DIR/db.sql"; do
+        if [ -f "$candidate" ]; then echo "$candidate"; return 0; fi
+    done
+}
+
+import_dump() {
+    local dump=$1
+    log "importing database dump $(basename "$dump")"
+    db -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\`"
+    if [[ $dump == *.gz ]]; then gunzip -c "$dump" | db "$DB_NAME"; else db "$DB_NAME" < "$dump"; fi
+    [ "$(db -N -e "SHOW TABLES LIKE 'vtiger_version'" "$DB_NAME")" = vtiger_version ] \
+        || die "no vtiger tables in the dump"
+    touch "$IMPORT_LOADED"
+}
+
+bootstrap() {
+    local dump
+    [ -f "$DOCROOT/config.inc.php" ] || die "no vtiger in $DOCROOT (config.inc.php missing)"
+    wait_for_db
+    dump=$(find_dump)
+    if [ -n "$dump" ] && [ ! -e "$IMPORT_LOADED" ]; then import_dump "$dump"; fi
+    chown -R www-data:www-data "$DOCROOT"
+    date -u +%FT%TZ > "$MARKER"
+    log "CRM ready"
+}
+
+main() {
+    if [ $# -eq 0 ]; then set -- php-fpm; fi
+    if [ "$1" = php-fpm ] && [ ! -e "$MARKER" ]; then bootstrap; fi
+    exec docker-php-entrypoint "$@"
+}
+
+main "$@"

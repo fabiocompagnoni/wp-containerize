@@ -6,9 +6,9 @@ ARG WP_CLI_SHA512
 ARG REDIS_CACHE_VERSION
 
 # mariadb-client: wp-cli db import/export; coreutils/tar: GNU tools used by the scripts;
-# fcgi: health checks and smoke tests against PHP-FPM; phpredis: object cache
+# fcgi: health checks and smoke tests against PHP-FPM; msmtp: email through the SMTP of the site (sendmail_path); phpredis: object cache
 RUN set -eux; \
-    apk add --no-cache mariadb-client coreutils tar fcgi; \
+    apk add --no-cache mariadb-client coreutils tar fcgi msmtp; \
     apk add --no-cache --virtual .build-deps $PHPIZE_DEPS; \
     pecl install redis; \
     docker-php-ext-enable redis; \

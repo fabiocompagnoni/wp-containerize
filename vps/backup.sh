@@ -86,6 +86,8 @@ backup_site() {
     dump_db "$name" || { log "$name: database dump failed"; return 1; }
     restic_ backup --quiet --tag "site:$name" \
         --exclude "/sites/$name/html/wp-content/cache" \
+        --exclude "/sites/$name/html/cache" \
+        --exclude "/sites/$name/html/logs" \
         --exclude "/sites/$name/import" \
         "/sites/$name" "/dumps/$name.sql" \
         || { log "$name: restic backup failed"; return 1; }
@@ -110,6 +112,11 @@ cmd_run() {
 
     for name in "${names[@]}"; do
         valid_site_name "$name" || { log "skipped invalid site name $name"; continue; }
+        # a stopped site (prepared, not started yet) has no new data and no database to dump
+        if [ "$(docker inspect -f '{{.State.Running}}' "$name-db" 2>/dev/null)" != true ]; then
+            log "$name: database not running, skipped"
+            continue
+        fi
         backup_site "$name" || failed+=("$name")
         rm -f "$dumps/$name.sql"
     done

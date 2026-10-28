@@ -1,0 +1,111 @@
+# vtiger CRM behind the edge proxy, which terminates TLS and forwards plain HTTP on the
+# internal <site>_edge network. Mounted in place of the WordPress templates of the nginx
+# image (vtiger/compose.yaml); the snippets of the image are reused.
+# ${...} values are filled in at startup by envsubst.
+
+server_tokens off;
+client_max_body_size 64m;
+client_body_timeout 30s;
+client_header_timeout 15s;
+send_timeout 60s;
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_min_length 1024;
+gzip_types text/plain text/css text/xml application/xml application/json
+           application/javascript image/svg+xml font/woff2;
+
+# Real client IP, set by the edge proxy: only the edge reaches this nginx
+set_real_ip_from 10.0.0.0/8;
+set_real_ip_from 172.16.0.0/12;
+set_real_ip_from 192.168.0.0/16;
+real_ip_header X-Real-IP;
+
+# Rate limits per real client IP. The CRM interface sends many AJAX requests:
+# generous bursts on pages, strict on the webservice (API) entry points.
+limit_req_zone $binary_remote_addr zone=pages:10m rate=${NGINX_RATE_PAGES};
+limit_req_zone $binary_remote_addr zone=api:10m   rate=${NGINX_RATE_API};
+limit_req_status 429;
+limit_conn_zone $binary_remote_addr zone=perip:10m;
+limit_conn_status 429;
+
+map $http_user_agent $bad_bot {
+    default 0;
+    ""      1;
+    ~*(sqlmap|nikto|nmap|masscan|zgrab|wpscan|acunetix|nessus|dirbuster|gobuster|nuclei) 1;
+}
+
+map $request_method $method_allowed {
+    default 0;
+    ~^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$ 1;
+}
+
+upstream php {
+    server app:9000;
+    keepalive 8;
+}
+
+# Health check for Docker, reachable only from inside the container
+server {
+    listen 127.0.0.1:8080;
+    access_log off;
+    location = /healthz { return 200 "ok\n"; }
+    location / { return 404; }
+}
+
+# Any other host name: drop
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name ${SITE_DOMAIN};
+
+    root /var/www/html;
+    index index.php;
+
+    if ($method_allowed = 0)  { return 405; }
+    if ($bad_bot)             { return 403; }
+
+    include /etc/nginx/snippets/security-headers.conf;
+    limit_conn perip ${NGINX_CONN_PER_IP};
+
+    # never served directly: hidden files, configuration, data, logs, caches, backups.
+    # Attachments in storage/ are downloaded through index.php, which checks permissions.
+    location ~ /\. { return 404; }
+    location ~* ^/(?:storage|logs|cache|backup|user_privileges|cron|test/(?:templates_c|vtlib|wordtemplatedownload))/ { return 403; }
+    location ~* ^/(?:config(?:\.[a-z_]+)?\.inc\.php|config\.[a-z_]+\.php|tabdata\.php|parent_tabdata\.php|install\.php|vtigerversion\.php|composer\.(?:json|lock)|migrate/.*)$ { return 404; }
+    location ^~ /vendor/ { return 404; }
+    location ~* \.(?:sql|bak|old|orig|swp|log|ini|sh|tpl|zip|tar|gz|tgz|7z|rar)$ { return 404; }
+    # PHP never runs from the folders written by the CRM
+    location ~* ^/(?:test|layouts/.*/skins)/.*\.(?:php\d?|phtml|phar)$ { return 403; }
+
+    location ~* ^/(?:webservice\.php|modules/Mobile/api\.php) {
+        limit_req zone=api burst=20 nodelay;
+        try_files $uri =404;
+        include /etc/nginx/snippets/fastcgi-vtiger.conf;
+    }
+
+    # static files straight from disk
+    location ~* \.(?:css|js|mjs|jpe?g|png|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot)$ {
+        try_files $uri =404;
+        expires 7d;
+        access_log off;
+        add_header Cache-Control "public" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    location / {
+        limit_req zone=pages burst=60 nodelay;
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        limit_req zone=pages burst=60 nodelay;
+        try_files $uri =404;
+        include /etc/nginx/snippets/fastcgi-vtiger.conf;
+    }
+}
