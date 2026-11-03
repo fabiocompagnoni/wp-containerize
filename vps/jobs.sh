@@ -87,6 +87,10 @@ cmd_update() {
         fi
         log "$name: updating"
         ./site.sh "$name" run --rm updater </dev/null || failed+=("$name")
+        # graceful reload of PHP-FPM (PID 1 of the wordpress container): after a rollback
+        # OPcache may still serve the compiled files of the updated, removed code (error 500)
+        ./site.sh "$name" exec -T wordpress kill -USR2 1 \
+            || { log "$name: PHP-FPM reload failed"; failed+=("$name"); }
     done
     [ ${#failed[@]} -eq 0 ] || die "update failed or rolled back for: ${failed[*]}"
 }

@@ -57,10 +57,13 @@ update_all() {
 }
 
 # Smoke test straight against PHP-FPM (FastCGI), as nginx would call it.
-# PHP-FPM omits the Status header for 200 responses.
-#   kind page: the error page of WordPress ("critical error on this website") is a failure
-#   kind json: the body must be valid JSON (REST API: plugins may describe "Fatal Error"
-#              log levels in it, so its text is not searched)
+# PHP-FPM omits the Status header for 200 responses. A redirect (3xx) passes: WordPress
+# answered without a fatal error (language or canonical host redirects, a login page moved
+# by a security plugin), and its body has nothing to check.
+#   kind page:  the error page of WordPress ("critical error on this website") is a failure
+#   kind login: as page, and 403/404 also pass (login hidden by a security plugin)
+#   kind json:  the body must be valid JSON (REST API: plugins may describe "Fatal Error"
+#               log levels in it, so its text is not searched)
 fastcgi_check() {
     local script=$1 uri=$2 kind=${3:-page} host response status body
     host=${WP_HOME#*://}; host=${host%%/*}
@@ -70,7 +73,13 @@ fastcgi_check() {
         HTTP_HOST="$host" SERVER_NAME="$host" SERVER_PORT=443 HTTPS=on REMOTE_ADDR=127.0.0.1 \
         timeout 30 cgi-fcgi -bind -connect "$WORDPRESS_FPM" 2>&1) || { log "smoke test $uri: no answer"; return 1; }
     status=$(printf '%s\n' "$response" | sed -n '1,/^\r\?$/{s/^Status: \([0-9]*\).*/\1/p}' | head -n 1)
-    if [ "${status:-200}" != 200 ]; then log "smoke test $uri: HTTP $status"; return 1; fi
+    case "${status:-200}" in
+        2??) ;;
+        3??) return 0 ;;
+        403|404) [ "$kind" = login ] && return 0
+                 log "smoke test $uri: HTTP $status"; return 1 ;;
+        *) log "smoke test $uri: HTTP $status"; return 1 ;;
+    esac
     body=$(printf '%s\n' "$response" | sed '1,/^\r\?$/d')
     case "$kind" in
         json)
@@ -105,7 +114,7 @@ check_all() {
     fi
 
     fastcgi_check index.php /                 || ok=1
-    fastcgi_check wp-login.php /wp-login.php  || ok=1
+    fastcgi_check wp-login.php /wp-login.php login || ok=1
     fastcgi_check index.php /wp-json/ json    || ok=1
 
     if vulnerabilities "$RUN_DIR/vulns.after"; then
