@@ -23,8 +23,9 @@ fi
 
 tar -C . \
     --exclude=./sites --exclude=./backup --exclude=./incoming \
-    --exclude=./backup.env --exclude=./build.local.env --exclude=./.jobs-update.lock \
+    --exclude=./backup.env --exclude=./edge.env --exclude=./build.local.env --exclude=./.jobs-update.lock \
     --exclude=./edge/conf.d --exclude=./edge/sites.yaml --exclude=./edge/origin-pull-ca.pem \
+    --exclude=./edge/.certs.sha256 \
     -czf - . \
     | ssh "$@" "$target" \
         'install -d /srv/wp && tar -C /srv/wp -xzf - --no-same-owner --no-same-permissions && chmod 0750 /srv/wp'

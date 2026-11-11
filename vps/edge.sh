@@ -22,8 +22,12 @@ case "${1:-}" in
 esac
 [ -f images.env ] || die "images.env not found: run build.sh and copy it here"
 
+# edge.env (optional, only on the VPS): sizes of the edge on this host, e.g.
+# EDGE_MEMORY=512M, EDGE_CPUS=1.00 (request bodies are buffered in its memory)
+edge_env=()
+[ ! -f edge.env ] || edge_env=(--env-file edge.env)
 compose() {
-    docker compose -f edge/compose.yaml -f edge/sites.yaml --env-file images.env "$@"
+    docker compose -f edge/compose.yaml -f edge/sites.yaml --env-file images.env "${edge_env[@]}" "$@"
 }
 
 new_conf=$(mktemp -d)
@@ -49,9 +53,16 @@ for env_file in sites/*/.env; do
     if [ ! -s "$secrets/origin_cert.pem" ] || [ ! -s "$secrets/origin_key.pem" ]; then
         log "skipped $name: origin_cert.pem / origin_key.pem missing in $secrets"; continue
     fi
+    # upload size and response time allowed for this site (e.g. a shop back office)
+    max_body=$(env_value "$env_file" EDGE_MAX_BODY); max_body=${max_body:-32m}
+    read_timeout=$(env_value "$env_file" EDGE_READ_TIMEOUT); read_timeout=${read_timeout:-90s}
+    if [[ ! $max_body =~ ^[0-9]{1,4}[km]$ ]] || [[ ! $read_timeout =~ ^[0-9]{1,4}s$ ]]; then
+        log "skipped $name: EDGE_MAX_BODY (e.g. 64m) or EDGE_READ_TIMEOUT (e.g. 300s) not valid"; continue
+    fi
     [ "$mode" = cloudflare ] && cloudflare=1
 
     sed -e "s/@SITE_NAME@/$name/g" -e "s/@SITE_DOMAIN@/$domain/g" -e "s/@ORIGIN_MODE@/$mode/g" \
+        -e "s/@EDGE_MAX_BODY@/$max_body/g" -e "s/@EDGE_READ_TIMEOUT@/$read_timeout/g" \
         edge/site.conf.template > "$new_conf/$name.conf"
     ensure_edge_network "$name"
     networks+="      ${name}_edge: {}"$'\n'
