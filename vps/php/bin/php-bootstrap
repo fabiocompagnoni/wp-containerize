@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Entrypoint of the php image. On the first start of Apache, for a migrated site:
+#   - imports /import/db.sql[.gz] into the site database, always from an empty database
+#     (an import that stopped halfway is never taken as complete)
+#   - gives the files to www-data (applications write caches, uploads and their own
+#     .htaccess; PrestaShop also updates itself from the back office)
+# then hands over to the official entrypoint. The configuration of the application
+# (database host "db", user and password) is prepared before the first start.
+set -Eeuo pipefail
+
+DOCROOT=/var/www/html
+IMPORT_DIR=/import
+MARKER="$DOCROOT/.php-bootstrap-done"
+IMPORT_LOADED="$DOCROOT/.php-import-loaded"   # the whole dump is in the database
+
+log() { printf '[bootstrap] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+: "${DB_NAME:?DB_NAME is required}"
+: "${DB_USER:?DB_USER is required}"
+
+# MariaDB client as the site user; the password stays out of the process arguments
+db() {
+    MYSQL_PWD=$(cat /run/secrets/db_password) mariadb -h db -u "$DB_USER" "$@"
+}
+
+wait_for_db() {
+    local attempt
+    for attempt in $(seq 1 90); do
+        if db -e 'SELECT 1' >/dev/null 2>&1; then return 0; fi
+        log "waiting for the database ($attempt/90)"
+        sleep 2
+    done
+    die "database not reachable"
+}
+
+find_dump() {
+    local candidate
+    for candidate in "$IMPORT_DIR/db.sql.gz" "$IMPORT_DIR/db.sql"; do
+        if [ -f "$candidate" ]; then echo "$candidate"; return 0; fi
+    done
+}
+
+import_dump() {
+    local dump=$1 tables
+    log "importing database dump $(basename "$dump") (large shops take several minutes)"
+    db -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\`"
+    if [[ $dump == *.gz ]]; then
+        gunzip -c "$dump" | db --max-allowed-packet=64M "$DB_NAME"
+    else
+        db --max-allowed-packet=64M "$DB_NAME" < "$dump"
+    fi
+    tables=$(db -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()" "$DB_NAME")
+    [ "${tables:-0}" -gt 0 ] || die "no tables imported from the dump"
+    log "dump imported: $tables tables"
+    touch "$IMPORT_LOADED"
+}
+
+bootstrap() {
+    local dump
+    [ -n "$(ls -A "$DOCROOT" 2>/dev/null)" ] || die "no site in $DOCROOT"
+    wait_for_db
+    dump=$(find_dump)
+    if [ -n "$dump" ] && [ ! -e "$IMPORT_LOADED" ]; then import_dump "$dump"; fi
+    chown -R www-data:www-data "$DOCROOT"
+    date -u +%FT%TZ > "$MARKER"
+    log "site ready"
+}
+
+main() {
+    if [ $# -eq 0 ]; then set -- apache2-foreground; fi
+    : "${SITE_DOMAIN:?SITE_DOMAIN is required (Apache ServerName)}"
+    if [ "$1" = apache2-foreground ] && [ ! -e "$MARKER" ]; then bootstrap; fi
+    exec docker-php-entrypoint "$@"
+}
+
+main "$@"

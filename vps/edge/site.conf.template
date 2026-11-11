@@ -8,10 +8,14 @@ server {
     ssl_certificate_key /etc/nginx/certs/@SITE_NAME@.key;
     include /etc/nginx/snippets/origin-@ORIGIN_MODE@.conf;
 
+    # per site, from EDGE_MAX_BODY / EDGE_READ_TIMEOUT in its .env (defaults 32m / 90s)
+    client_max_body_size @EDGE_MAX_BODY@;
+
     location / {
         # variable: resolved at request time (see resolver in edge.conf)
         set $site_upstream http://@SITE_NAME@-web;
         proxy_pass $site_upstream;
         include /etc/nginx/snippets/proxy.conf;
+        proxy_read_timeout @EDGE_READ_TIMEOUT@;
     }
 }

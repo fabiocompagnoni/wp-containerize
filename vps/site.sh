@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # docker compose for one site, with images.env and the site settings. The compose file
-# depends on SITE_TYPE in the site .env: wordpress (default, compose.yaml) or vtiger
-# (vtiger/compose.yaml); paths in both are relative to this directory.
+# depends on SITE_TYPE in the site .env: wordpress (default, compose.yaml), vtiger
+# (vtiger/compose.yaml) or php (php/compose.yaml: PrestaShop, hand-written PHP sites);
+# paths in all of them are relative to this directory.
 # Usage: ./site.sh <site> <docker compose arguments>
 #   ./site.sh esempio up -d          ./site.sh esempio logs -f wordpress
 #   ./site.sh esempio exec wordpress wp --allow-root plugin list
@@ -21,7 +22,8 @@ env_file="sites/$name/.env"
 case "$(env_value "$env_file" SITE_TYPE)" in
     ""|wordpress) compose_file=compose.yaml ;;
     vtiger) compose_file=vtiger/compose.yaml ;;
-    *) die "SITE_TYPE in $env_file: wordpress or vtiger" ;;
+    php) compose_file=php/compose.yaml ;;
+    *) die "SITE_TYPE in $env_file: wordpress, vtiger or php" ;;
 esac
 
 if [ "$1" = up ]; then ensure_edge_network "$name"; fi

@@ -88,6 +88,9 @@ backup_site() {
         --exclude "/sites/$name/html/wp-content/cache" \
         --exclude "/sites/$name/html/cache" \
         --exclude "/sites/$name/html/logs" \
+        --exclude "/sites/$name/html/var/cache" \
+        --exclude "/sites/$name/html/var/logs" \
+        --exclude "/sites/$name/html/img/tmp" \
         --exclude "/sites/$name/import" \
         "/sites/$name" "/dumps/$name.sql" \
         || { log "$name: restic backup failed"; return 1; }

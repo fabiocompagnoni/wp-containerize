@@ -110,6 +110,29 @@ Dopo la verifica, `sites/esempio/import/` si può svuotare per recuperare spazio
 ./site.sh esempio up -d --wait && ./edge.sh
 ```
 
+## 5. Siti PHP (PrestaShop, siti scritti a mano)
+
+`SITE_TYPE=php` (`php/compose.yaml`): Apache con PHP (immagine `wp-php`, base `PHP_APACHE_IMAGE`
+in `build.env`) e un MariaDB dedicato. Il codice del sito non è nell'immagine: sta in
+`sites/<sito>/html` così com'è, `.htaccess` compresi (`AllowOverride All`); l'applicazione si
+aggiorna da sola (PrestaShop: Update Assistant), sempre dopo `./backup.sh run <sito>`.
+L'updater notturno e il cron di WordPress non toccano questi siti.
+
+```bash
+./new-site.sh esempio esempio.it --type php
+# file del sito in sites/esempio/html/, dump (facoltativo) in sites/esempio/import/db.sql.gz
+# configurazione dell'applicazione: host "db", database e utente "php",
+# password in sites/esempio/secrets/db_password (letta dal file, mai scritta nel codice)
+./site.sh esempio up -d --wait --wait-timeout 3600 && ./edge.sh
+```
+
+Al primo avvio il dump viene importato (una sola volta) e i file passano a `www-data`.
+Risorse e limiti, tutti nel `.env` del sito e applicati con `./site.sh <sito> up -d`:
+`WEB_CPUS`, `WEB_MEMORY`, `APACHE_MAX_WORKERS`, `PHP_MEMORY_LIMIT`, `PHP_MAX_EXECUTION_TIME`,
+`PHP_UPLOAD_MAX`, `PHP_OPCACHE_MEMORY`, `DB_CPUS`, `DB_MEMORY`, `DB_BUFFER_POOL`, e per l'edge
+`EDGE_MAX_BODY` / `EDGE_READ_TIMEOUT` (poi `./edge.sh`). Le risorse dell'edge stesso
+(`EDGE_MEMORY`, `EDGE_CPUS`) in `edge.env` sulla VPS.
+
 ## Email
 
 WordPress invia le email (moduli, notifiche, reset password) con msmtp tramite l'SMTP

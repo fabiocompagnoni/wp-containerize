@@ -6,7 +6,9 @@
 # "nginx -t" is rolled back. Run it after adding, removing or changing a site.
 #
 # Usage: ./edge.sh [--recreate]
-#   --recreate  restart the edge container (needed after replacing a certificate file)
+#   --recreate  restart the edge container. Done automatically when a certificate changed:
+#               the files are bind-mounted one by one, so a replaced file is not seen by
+#               the running edge (edge/.certs.sha256 keeps their fingerprint)
 set -Eeuo pipefail
 
 cd "$(dirname "$0")"
@@ -20,15 +22,19 @@ case "${1:-}" in
 esac
 [ -f images.env ] || die "images.env not found: run build.sh and copy it here"
 
+# edge.env (optional, only on the VPS): sizes of the edge on this host, e.g.
+# EDGE_MEMORY=512M, EDGE_CPUS=1.00 (request bodies are buffered in its memory)
+edge_env=()
+[ ! -f edge.env ] || edge_env=(--env-file edge.env)
 compose() {
-    docker compose -f edge/compose.yaml -f edge/sites.yaml --env-file images.env "$@"
+    docker compose -f edge/compose.yaml -f edge/sites.yaml --env-file images.env "${edge_env[@]}" "$@"
 }
 
 new_conf=$(mktemp -d)
 old_conf=$(mktemp -d)
 trap 'rm -rf "$new_conf" "$old_conf"' EXIT
 
-networks="" volumes="" declared="" cloudflare=0
+networks="" volumes="" declared="" cloudflare=0 cert_files=()
 for env_file in sites/*/.env; do
     [ -f "$env_file" ] || continue
     name=$(env_value "$env_file" SITE_NAME)
@@ -47,17 +53,32 @@ for env_file in sites/*/.env; do
     if [ ! -s "$secrets/origin_cert.pem" ] || [ ! -s "$secrets/origin_key.pem" ]; then
         log "skipped $name: origin_cert.pem / origin_key.pem missing in $secrets"; continue
     fi
+    # upload size and response time allowed for this site (e.g. a shop back office)
+    max_body=$(env_value "$env_file" EDGE_MAX_BODY); max_body=${max_body:-32m}
+    read_timeout=$(env_value "$env_file" EDGE_READ_TIMEOUT); read_timeout=${read_timeout:-90s}
+    if [[ ! $max_body =~ ^[0-9]{1,4}[km]$ ]] || [[ ! $read_timeout =~ ^[0-9]{1,4}s$ ]]; then
+        log "skipped $name: EDGE_MAX_BODY (e.g. 64m) or EDGE_READ_TIMEOUT (e.g. 300s) not valid"; continue
+    fi
     [ "$mode" = cloudflare ] && cloudflare=1
 
     sed -e "s/@SITE_NAME@/$name/g" -e "s/@SITE_DOMAIN@/$domain/g" -e "s/@ORIGIN_MODE@/$mode/g" \
+        -e "s/@EDGE_MAX_BODY@/$max_body/g" -e "s/@EDGE_READ_TIMEOUT@/$read_timeout/g" \
         edge/site.conf.template > "$new_conf/$name.conf"
     ensure_edge_network "$name"
     networks+="      ${name}_edge: {}"$'\n'
     volumes+="      - ../$secrets/origin_cert.pem:/etc/nginx/certs/$name.crt:ro"$'\n'
     volumes+="      - ../$secrets/origin_key.pem:/etc/nginx/certs/$name.key:ro"$'\n'
     declared+="  ${name}_edge:"$'\n'"    external: true"$'\n'
+    cert_files+=("$secrets/origin_cert.pem" "$secrets/origin_key.pem")
     log "site $name: $domain ($mode)"
 done
+
+# a replaced certificate is not seen by the running edge: recreate it when any changed
+certs_sum=$( { [ ${#cert_files[@]} -eq 0 ] || sha256sum "${cert_files[@]}"; } | sha256sum | cut -d' ' -f1)
+if [ -f edge/.certs.sha256 ] && [ "$(cat edge/.certs.sha256)" != "$certs_sum" ]; then
+    log "certificates changed: the edge is recreated"
+    recreate=(--force-recreate)
+fi
 
 if [ "$cloudflare" = 1 ] && [ ! -s edge/origin-pull-ca.pem ]; then
     die "edge/origin-pull-ca.pem missing: Cloudflare Authenticated Origin Pulls CA"
@@ -110,4 +131,5 @@ if ! apply; then
     compose exec -T edge nginx -s reload || true
     die "edge not updated, see the messages above"
 fi
+echo "$certs_sum" > edge/.certs.sha256
 log "edge updated"

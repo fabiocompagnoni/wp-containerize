@@ -2,10 +2,10 @@
 # Creates the directory of a new site instance:
 #   sites/<name>/.env       settings (from site.env.example)
 #   sites/<name>/secrets/   generated passwords, TLS certificate in test mode
-#   sites/<name>/html/      WordPress files (filled at the first start)
+#   sites/<name>/html/      files of the site (WordPress: filled at the first start)
 #   sites/<name>/import/    optional: files/wp-content/ and db.sql[.gz] of a site to migrate
 #
-# Usage: ./new-site.sh <name> <domain> [--test] [--type wordpress|vtiger]
+# Usage: ./new-site.sh <name> <domain> [--test] [--type wordpress|vtiger|php]
 #   --test  self-signed certificate and no Cloudflare checks (local VM)
 #   --type  application of the site (default wordpress), see site.sh
 set -Eeuo pipefail
@@ -13,7 +13,7 @@ set -Eeuo pipefail
 cd "$(dirname "$0")"
 . ./lib.sh
 
-usage() { echo "usage: $0 <name> <domain> [--test] [--type wordpress|vtiger]" >&2; exit 2; }
+usage() { echo "usage: $0 <name> <domain> [--test] [--type wordpress|vtiger|php]" >&2; exit 2; }
 
 [ $# -ge 2 ] || usage
 name=$1 domain=$2; shift 2
@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-case "$type" in wordpress|vtiger) ;; *) die "--type: wordpress or vtiger" ;; esac
+case "$type" in wordpress|vtiger|php) ;; *) die "--type: wordpress, vtiger or php" ;; esac
 db_name=$type   # database and its user are named after the application
 
 valid_site_name "$name" || die "name: lowercase letters, digits and '-' (max 31), not 'edge'"
@@ -84,6 +84,16 @@ if [ "$mode" = cloudflare ]; then
   - Cloudflare files in $site_dir/secrets/ (mode 0644):
       origin_cert.pem, origin_key.pem   Origin CA certificate and key for $domain
 EOF
+fi
+if [ "$type" = php ]; then
+    cat <<EOF
+  - files of the site in $site_dir/html/, dump (optional) in $site_dir/import/db.sql[.gz]
+  - database for the application: host db, name/user $db_name, password in secrets/db_password
+  - sizes (WEB_*, PHP_*, APACHE_MAX_WORKERS, DB_*, EDGE_*) in $site_dir/.env
+
+Start:  ./site.sh $name up -d --wait && ./edge.sh
+EOF
+    exit 0
 fi
 cat <<EOF
   - Wordfence API key in $site_dir/secrets/wordfence_api_key (updater)
