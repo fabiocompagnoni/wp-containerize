@@ -6,7 +6,9 @@
 # "nginx -t" is rolled back. Run it after adding, removing or changing a site.
 #
 # Usage: ./edge.sh [--recreate]
-#   --recreate  restart the edge container (needed after replacing a certificate file)
+#   --recreate  restart the edge container. Done automatically when a certificate changed:
+#               the files are bind-mounted one by one, so a replaced file is not seen by
+#               the running edge (edge/.certs.sha256 keeps their fingerprint)
 set -Eeuo pipefail
 
 cd "$(dirname "$0")"
@@ -28,7 +30,7 @@ new_conf=$(mktemp -d)
 old_conf=$(mktemp -d)
 trap 'rm -rf "$new_conf" "$old_conf"' EXIT
 
-networks="" volumes="" declared="" cloudflare=0
+networks="" volumes="" declared="" cloudflare=0 cert_files=()
 for env_file in sites/*/.env; do
     [ -f "$env_file" ] || continue
     name=$(env_value "$env_file" SITE_NAME)
@@ -56,8 +58,16 @@ for env_file in sites/*/.env; do
     volumes+="      - ../$secrets/origin_cert.pem:/etc/nginx/certs/$name.crt:ro"$'\n'
     volumes+="      - ../$secrets/origin_key.pem:/etc/nginx/certs/$name.key:ro"$'\n'
     declared+="  ${name}_edge:"$'\n'"    external: true"$'\n'
+    cert_files+=("$secrets/origin_cert.pem" "$secrets/origin_key.pem")
     log "site $name: $domain ($mode)"
 done
+
+# a replaced certificate is not seen by the running edge: recreate it when any changed
+certs_sum=$( { [ ${#cert_files[@]} -eq 0 ] || sha256sum "${cert_files[@]}"; } | sha256sum | cut -d' ' -f1)
+if [ -f edge/.certs.sha256 ] && [ "$(cat edge/.certs.sha256)" != "$certs_sum" ]; then
+    log "certificates changed: the edge is recreated"
+    recreate=(--force-recreate)
+fi
 
 if [ "$cloudflare" = 1 ] && [ ! -s edge/origin-pull-ca.pem ]; then
     die "edge/origin-pull-ca.pem missing: Cloudflare Authenticated Origin Pulls CA"
@@ -110,4 +120,5 @@ if ! apply; then
     compose exec -T edge nginx -s reload || true
     die "edge not updated, see the messages above"
 fi
+echo "$certs_sum" > edge/.certs.sha256
 log "edge updated"
