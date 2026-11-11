@@ -55,6 +55,8 @@ CRON_EVENT_TIMEOUT=${CRON_EVENT_TIMEOUT:-240}
 cmd_cron() {
     local name hook due failed=()
     for name in "$@"; do
+        # php sites: no wp-cron (scheduled tasks of the application are set up per site)
+        [ "$(site_type "$name")" != php ] || continue
         is_running "$name" || continue
         if [ "$(site_type "$name")" = vtiger ]; then
             vtiger_cron "$name" >/dev/null || { log "$name: vtiger cron failed"; failed+=("$name"); }
@@ -78,8 +80,10 @@ cmd_update() {
     exec 9>.jobs-update.lock
     flock -n 9 || die "another update is running"
     for name in "$@"; do
-        if ! is_running "$name"; then log "$name: not running, skipped"; continue; fi
+        # only WordPress is updated automatically: vtiger and php sites (e.g. PrestaShop,
+        # with its Update Assistant) are updated by hand, after a backup
         [ "$(site_type "$name")" = wordpress ] || continue
+        if ! is_running "$name"; then log "$name: not running, skipped"; continue; fi
         # backup on the Storage Box first: without it no update (the updater keeps only
         # a temporary local copy for its own rollback)
         if ! ./backup.sh run "$name"; then
