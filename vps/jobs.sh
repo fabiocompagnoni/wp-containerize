@@ -95,8 +95,25 @@ cmd_update() {
         # OPcache may still serve the compiled files of the updated, removed code (error 500)
         ./site.sh "$name" exec -T wordpress kill -USR2 1 \
             || { log "$name: PHP-FPM reload failed"; failed+=("$name"); }
+        refresh_pages "$name" || log "$name: page cache not refreshed"
     done
     [ ${#failed[@]} -eq 0 ] || die "update failed or rolled back for: ${failed[*]}"
+}
+
+# After an update (or a rollback) the cached pages may point to files that no longer
+# exist: Elementor deletes its generated CSS when it is updated and rebuilds it only when
+# PHP renders a page, which never happens while the page comes from the cache (the site
+# shows without layout). Rebuild Elementor's CSS, empty the page cache, render the home.
+refresh_pages() {
+    local name=$1 host
+    if site_wp "$name" plugin is-active elementor 2>/dev/null; then
+        site_wp "$name" elementor flush-css >/dev/null 2>&1 || log "$name: Elementor CSS not flushed"
+    fi
+    site_wp "$name" eval 'do_action("rt_nginx_helper_purge_all");' >/dev/null 2>&1 || return 1
+    host=$(env_value "sites/$name/.env" SITE_URL); host=${host#*://}; host=${host%%/*}
+    [ -n "$host" ] || host=$(env_value "sites/$name/.env" SITE_DOMAIN)
+    ./site.sh "$name" exec -T nginx curl -fsS -o /dev/null --max-time 60 \
+        -H "Host: $host" -H "X-Forwarded-Proto: https" http://127.0.0.1/ >/dev/null 2>&1
 }
 
 [ $# -ge 1 ] || die "usage: $0 cron|update [<site>...]"
